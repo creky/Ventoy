@@ -101,14 +101,96 @@ get_disk_part_name() {
     fi
 }
 
-check_umount_disk() {
-    DiskOrPart="$1"
-    grep "^${DiskOrPart}" /proc/mounts | while read mtline; do
-        mtpnt=$(echo $mtline | awk '{print $2}')
-        vtdebug "Trying to umount $mtpnt ..."
-        umount $mtpnt >/dev/null 2>&1
+get_disk_mounts() (
+    devices="$1"
+    entries=$(awk '{
+        for (i=7; i<=NF; i++) if ($i == "-") { print $3 " " $5 " " $(i+2); break }
+    }' /proc/self/mountinfo) || return 1
+    while read -r mountdev encoded_path encoded_source; do
+        [ -n "$mountdev" ] || continue
+        case " $devices " in
+            *" $mountdev "*) ;;
+            *)
+                # FUSE filesystems have a virtual mount device; resolve their block source too.
+                source=$(printf '%bX' "$encoded_source")
+                source=${source%X}
+                [ -b "$source" ] || continue
+                hexdev=$(stat -Lc '%t:%T' "$source") || return 1
+                sourcedev=$(printf '%d:%d' "0x${hexdev%:*}" "0x${hexdev#*:}") || return 1
+                case " $devices " in
+                    *" $sourcedev "*) ;;
+                    *) continue ;;
+                esac
+                ;;
+        esac
+        printf '%s %s\n' "$mountdev" "$encoded_path"
+    done <<EOF
+$entries
+EOF
+)
+
+check_umount_disk() (
+    for tool in stat readlink mountpoint; do
+        if ! command -v "$tool" >/dev/null 2>&1; then
+            vterr "Required command '$tool' is missing. Install it with your Linux package manager, then retry. Unmounting has not started."
+            return 1
+        fi
     done
-}
+    if ! [ -b "$1" ]; then
+        vterr "The target device $1 is unavailable. Stop and reconnect it before retrying."
+        return 1
+    fi
+    hexdev=$(stat -Lc '%t:%T' "$1") || return 1
+    devno=$(printf '%d:%d' "0x${hexdev%:*}" "0x${hexdev#*:}") || return 1
+    blockpath=$(readlink -f "/sys/dev/block/$devno") || return 1
+    devices=$(cat "$blockpath/dev") || return 1
+    for partition in "$blockpath"/*/partition; do
+        [ -f "$partition" ] || continue
+        partdev=$(cat "${partition%/partition}/dev") || return 1
+        devices="$devices $partdev"
+    done
+
+    while read -r swap_source swap_rest; do
+        [ "$swap_source" != Filename ] || continue
+        swap_source=$(printf '%bX' "$swap_source")
+        swap_source=${swap_source%X}
+        [ -b "$swap_source" ] || continue
+        hexdev=$(stat -Lc '%t:%T' "$swap_source") || return 1
+        swapdev=$(printf '%d:%d' "0x${hexdev%:*}" "0x${hexdev#*:}") || return 1
+        case " $devices " in
+            *" $swapdev "*) vterr "$swap_source is active swap. Run swapoff before retrying."; return 1 ;;
+        esac
+    done < /proc/swaps || return 1
+
+    mounts=$(get_disk_mounts "$devices") || return 1
+    # Unmount child paths before their parents; mountinfo escapes spaces and backslashes.
+    mounts=$(printf '%s\n' "$mounts" | LC_ALL=C sort -rk2,2) || return 1
+    while read -r mountdev encoded_path; do
+        [ -n "$mountdev" ] || continue
+        mtpnt=$(printf '%bX' "$encoded_path")
+        mtpnt=${mtpnt%X}
+        visible_dev=$(mountpoint -d "$mtpnt") || {
+            vterr "The mount at $mtpnt changed. Check the target disk before retrying."
+            return 1
+        }
+        if [ "$visible_dev" != "$mountdev" ]; then
+            vterr "Another device covers $mtpnt. Unmount it manually before retrying."
+            return 1
+        fi
+        vtdebug "Trying to umount $mtpnt ..."
+        if ! umount "$mtpnt"; then
+            vterr "Cannot unmount $mtpnt. Close applications using it, then retry."
+            return 1
+        fi
+    done <<EOF
+$mounts
+EOF
+    remaining=$(get_disk_mounts "$devices") || return 1
+    if [ -n "$remaining" ]; then
+        vterr 'The target disk still has mounted partitions. Disable automatic mounting and retry.'
+        return 1
+    fi
+)
 
 get_ventoy_version_from_cfg() {
     if grep -q 'set.*VENTOY_VERSION=' $1; then
@@ -395,7 +477,7 @@ EOF
 
     echo "create efi fat fs $PART2 ..."
     for i in 0 1 2 3 4 5 6 7 8 9; do
-        check_umount_disk "$PART2"
+        check_umount_disk "$PART2" || return 1
 
         if mkfs.vfat -F 16 -n VTOYEFI -s 1 $PART2; then
             echo 'success'
@@ -513,7 +595,7 @@ format_ventoy_disk_gpt() {
     echo "create efi fat fs $PART2 ..."
     
     for i in 0 1 2 3 4 5 6 7 8 9; do
-        check_umount_disk "$PART2"
+        check_umount_disk "$PART2" || return 1
         
         if mkfs.vfat -F 16 -n VTOYEFI -s 1 $PART2; then
             echo 'success'

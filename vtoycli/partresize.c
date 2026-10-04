@@ -21,7 +21,6 @@
 #define _GNU_SOURCE
 #endif
 #include <stdio.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
@@ -31,7 +30,6 @@
 #include <sys/mman.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
-#include <sys/types.h>
 #include <dirent.h>
 #include <linux/fs.h>
 #include <limits.h>
@@ -505,8 +503,103 @@ static int WriteDataToPhyDisk(int fd, UINT64 offset, void *buffer, int len)
     return 1;
 }
 
+typedef struct VTOY_FRONT_IO
+{
+    const char *stage;
+    const char *disk;
+    const char *directory;
+    int media_failure;
+} VTOY_FRONT_IO;
+
+static int front_io_failure(VTOY_FRONT_IO *io, const char *target, const char *operation,
+    UINT64 offset, int len, int completed, int error, int disk)
+{
+    fprintf(stderr, "Front EFI %s: %s %s; requested byte offset=%llu length=%d, completed=%d",
+        io->stage, operation, target, offset, len, completed);
+    if (disk && len)
+        fprintf(stderr, "; associated request LBA range=%llu-%llu", offset / 512, (offset + len - 1) / 512);
+    if (error > 0)
+        fprintf(stderr, "; errno=%d (%s).\n", error, strerror(error));
+    else if (error == 0)
+        fprintf(stderr, "; content mismatch within the requested range (not an OS I/O error).\n");
+    else
+        fprintf(stderr, "; unexpected EOF or zero I/O progress (no OS error reported).\n");
+    if (!strcmp(operation, "fsync"))
+        fprintf(stderr, "The range identifies the associated request; fsync does not locate a failing sector.\n");
+    if (error <= 0 || error == EIO || error == ENODEV || error == ENXIO || error == ETIMEDOUT)
+    {
+        if (!io->media_failure)
+        {
+            if (disk)
+                fprintf(stderr, "Stop installation. Preserve recovery files and rescue or clone existing data to a known-good disk first. Check the affected device and connection; do not repeatedly install or format it.\n");
+            else
+                fprintf(stderr, "Stop using this backup/package location and use known-good storage. Preserve existing recovery files. The target disk write state is reported separately below; do not format the target.\n");
+        }
+        io->media_failure = 1;
+    }
+    return 1;
+}
+
+static int front_io_all(VTOY_FRONT_IO *io, int fd, const char *target, UINT64 offset,
+    void *buffer, int len, int save, int disk)
+{
+    int done = 0;
+    ssize_t actual;
+    while (done < len)
+    {
+        if (save)
+            actual = pwrite(fd, (UINT8 *)buffer + done, len - done, offset + done);
+        else
+            actual = pread(fd, (UINT8 *)buffer + done, len - done, offset + done);
+        if (actual < 0 && errno == EINTR) continue;
+        if (actual <= 0)
+            return front_io_failure(io, target, save ? "write" : "read", offset, len,
+                done, actual < 0 ? errno : -1, disk);
+        done += (int)actual;
+    }
+    return 0;
+}
+
+static int front_sync(VTOY_FRONT_IO *io, int fd, const char *target, UINT64 offset, int len, int disk)
+{
+    int rc;
+    do { rc = fsync(fd); } while (rc && errno == EINTR);
+    return rc ? front_io_failure(io, target, "fsync", offset, len, 0, errno, disk) : 0;
+}
+
+static int front_ioctl(VTOY_FRONT_IO *io, int fd, unsigned long request, void *value, const char *operation)
+{
+    int rc;
+    do { rc = ioctl(fd, request, value); } while (rc && errno == EINTR);
+    return rc ? front_io_failure(io, io->disk, operation, 0, 0, 0, errno, 1) : 0;
+}
+
+static int front_verify(VTOY_FRONT_IO *io, int fd, const char *target, UINT64 offset,
+    const UINT8 *buffer, int len, int disk)
+{
+    int done, size;
+    UINT8 check[65536];
+    for (done = 0; done < len; done += size)
+    {
+        size = len - done > sizeof(check) ? sizeof(check) : len - done;
+        if (front_io_all(io, fd, target, offset + done, check, size, 0, disk)) return 1;
+        if (memcmp(check, buffer + done, size))
+        {
+            return front_io_failure(io, target, "readback", offset, len, done + size, 0, disk);
+        }
+    }
+    return 0;
+}
+
+static int front_write_verify(VTOY_FRONT_IO *io, int fd, UINT64 offset, void *buffer, int len)
+{
+    if (front_io_all(io, fd, io->disk, offset, buffer, len, 1, 1) ||
+        front_sync(io, fd, io->disk, offset, len, 1)) return 1;
+    return front_verify(io, fd, io->disk, offset, buffer, len, 1);
+}
+
 /* Front installation supports canonical basic disks only. Validate before any write. */
-static int front_read_table(int fd, UINT64 sectors, VTOY_GPT_INFO *gpt, int installed, int report)
+static int front_read_table(VTOY_FRONT_IO *io, int fd, UINT64 sectors, VTOY_GPT_INFO *gpt, int installed, int report)
 {
     int i, j, count, empty = 0, logical = 0;
     UINT32 crc;
@@ -516,9 +609,9 @@ static int front_read_table(int fd, UINT64 sectors, VTOY_GPT_INFO *gpt, int inst
     int isgpt;
 #define FRONT_REJECT(reason) do { if (report) fprintf(stderr, "%s\n", reason); return -1; } while (0)
 
-    if (ioctl(fd, BLKSSZGET, &logical) != 0 || logical != 512 || sectors <= 67584 ||
-        lseek(fd, 0, SEEK_SET) != 0 || read(fd, gpt, sizeof(*gpt)) != sizeof(*gpt) ||
-        gpt->MBR.Byte55 != 0x55 || gpt->MBR.ByteAA != 0xAA)
+    if (front_ioctl(io, fd, BLKSSZGET, &logical, "get logical sector size") ||
+        front_io_all(io, fd, io->disk, 0, gpt, sizeof(*gpt), 0, 1)) return -1;
+    if (logical != 512 || sectors <= 67584 || gpt->MBR.Byte55 != 0x55 || gpt->MBR.ByteAA != 0xAA)
         FRONT_REJECT("Cannot read a valid 512-byte-sector disk and partition table.");
 
     isgpt = gpt->MBR.PartTbl[0].FsFlag == 0xEE;
@@ -533,16 +626,20 @@ static int front_read_table(int fd, UINT64 sectors, VTOY_GPT_INFO *gpt, int inst
             header.PartTblStartLBA != 2 || header.PartTblTotNum != 128 ||
             header.PartTblEntryLen != 128 || header.PartAreaStartLBA < 34 ||
             header.PartAreaStartLBA > 2048 || header.PartAreaEndLBA >= sectors - 33 ||
+            header.PartAreaEndLBA < 67584 ||
             VtoyCrc32(&header, header.Length) != crc ||
             VtoyCrc32(gpt->PartTbl, sizeof(gpt->PartTbl)) != header.PartTblCrc)
             FRONT_REJECT("GPT primary header/table is invalid, or is not the supported 128-entry layout.");
         for (i = 1; i < 4; i++)
             if (gpt->MBR.PartTbl[i].FsFlag || gpt->MBR.PartTbl[i].SectorCount)
                 FRONT_REJECT("Hybrid MBR/GPT disks are unsupported.");
-        if (lseek(fd, (sectors - 33) * 512, SEEK_SET) != (sectors - 33) * 512 ||
-            read(fd, &backup, sizeof(backup)) != sizeof(backup) ||
-            memcmp(backup.PartTbl, gpt->PartTbl, sizeof(gpt->PartTbl)))
-            FRONT_REJECT("GPT backup cannot be read or differs from the primary partition table. Repair the table before retrying.");
+        if (front_io_all(io, fd, io->disk, (sectors - 33) * 512, &backup, sizeof(backup), 0, 1)) return -1;
+        if (memcmp(backup.PartTbl, gpt->PartTbl, sizeof(gpt->PartTbl)))
+        {
+            front_io_failure(io, io->disk, "compare GPT backup with primary", (sectors - 33) * 512,
+                sizeof(gpt->PartTbl), sizeof(gpt->PartTbl), 0, 1);
+            return -1;
+        }
         header = backup.Head;
         crc = header.Crc;
         header.Crc = 0;
@@ -569,6 +666,11 @@ static int front_read_table(int fd, UINT64 sectors, VTOY_GPT_INFO *gpt, int inst
                 empty++;
                 continue;
             }
+            if (!memcmp(&gpt->PartTbl[i].PartGuid, &g_ZeroGuid, sizeof(GUID)))
+                FRONT_REJECT("A used GPT partition has no unique GUID. Repair the partition table before retrying.");
+            for (j = 0; j < i; j++)
+                if (end[j] && !memcmp(&gpt->PartTbl[i].PartGuid, &gpt->PartTbl[j].PartGuid, sizeof(GUID)))
+                    FRONT_REJECT("Used GPT partitions share the same GUID. Repair the partition table before retrying.");
             if (!memcmp(&gpt->PartTbl[i].PartType, &ldmdata, sizeof(GUID)) ||
                 !memcmp(&gpt->PartTbl[i].PartType, &ldmmeta, sizeof(GUID)) ||
                 !memcmp(&gpt->PartTbl[i].PartType, &spaces, sizeof(GUID)) ||
@@ -608,8 +710,14 @@ static int front_read_table(int fd, UINT64 sectors, VTOY_GPT_INFO *gpt, int inst
             if (end[j] && start[i] < end[j] && start[j] < end[i])
                 FRONT_REJECT("Existing partitions overlap. Repair the layout before retrying.");
     }
-    if (!end[0] || (!installed && (!empty || start[0] < 67584)))
+    if (installed && (!end[0] || !end[1]))
+        FRONT_REJECT("The existing Ventoy layout is missing its data or EFI partition. Inspect the partition table before updating.");
+    if (!installed && (!end[0] || !empty || start[0] < 67584))
         FRONT_REJECT("Partition 1 must contain data, and installation needs at least one unused partition-table entry.");
+    if (!installed)
+        for (i = 1; i < count; i++)
+            if (end[i] && start[i] < end[0])
+                FRONT_REJECT("Data partition 1 must be physically before the other partitions. Check partition numbering/order in your partition tool; do not format the disk.");
     if (!installed && !isgpt)
     {
         UINT8 type = gpt->MBR.PartTbl[0].FsFlag;
@@ -635,62 +743,67 @@ typedef struct VTOY_FRONT_SNAPSHOT
     VTOY_GPT_INFO table;
 } VTOY_FRONT_SNAPSHOT;
 
-static int front_read_snapshot(int fd, VTOY_FRONT_SNAPSHOT *snapshot)
+static int front_read_snapshot(VTOY_FRONT_IO *io, int fd, VTOY_FRONT_SNAPSHOT *snapshot)
 {
     struct stat st;
-    int logical = 0;
+    int logical = 0, rc;
     memset(snapshot, 0, sizeof(*snapshot));
     memcpy(snapshot->magic, "VTOY_FRONT_V1", 13);
-    if (fstat(fd, &st) || !S_ISBLK(st.st_mode) ||
-        ioctl(fd, BLKSSZGET, &logical) || logical != 512 ||
-        ioctl(fd, BLKGETSIZE64, &snapshot->bytes) ||
-        lseek(fd, 0, SEEK_SET) != 0 ||
-        read(fd, &snapshot->table, sizeof(snapshot->table)) != sizeof(snapshot->table))
-        return 1;
+    if (fstat(fd, &st)) return front_io_failure(io, io->disk, "fstat", 0, 0, 0, errno, 1);
+    if (!S_ISBLK(st.st_mode))
+        return front_io_failure(io, io->disk, "validate block device", 0, 0, 0, EINVAL, 1);
+    if (front_ioctl(io, fd, BLKSSZGET, &logical, "get logical sector size") ||
+        front_ioctl(io, fd, BLKGETSIZE64, &snapshot->bytes, "get disk size") ||
+        front_io_all(io, fd, io->disk, 0, &snapshot->table, sizeof(snapshot->table), 0, 1)) return 1;
+    if (logical != 512)
+        return front_io_failure(io, io->disk, "validate 512-byte sectors", 0, 0, 0, EINVAL, 1);
     snapshot->device = (UINT64)st.st_rdev;
     /* Older kernels do not expose diskseq; the table, disk ID and size still bind the snapshot. */
-    if (ioctl(fd, BLKGETDISKSEQ, &snapshot->diskseq)) snapshot->diskseq = 0;
+    do { rc = ioctl(fd, BLKGETDISKSEQ, &snapshot->diskseq); } while (rc && errno == EINTR);
+    if (rc)
+    {
+        if (errno != ENOTTY && errno != EINVAL && errno != ENOSYS)
+            return front_io_failure(io, io->disk, "get disk sequence", 0, 0, 0, errno, 1);
+        snapshot->diskseq = 0;
+    }
     return 0;
 }
 
-static int front_file(int dirfd, const char *name, void *buffer, int len, int save)
+static int front_file(VTOY_FRONT_IO *io, int dirfd, const char *name, void *buffer, int len, int save)
 {
-    int rc = 1;
-    int fd = openat(dirfd, name, (save ? O_WRONLY | O_CREAT | O_EXCL : O_RDONLY) | O_NOFOLLOW, 0600);
-    ssize_t actual;
+    int rc = 1, fd, pathlen;
+    char path[PATH_MAX];
     struct stat st;
-    if (fd < 0) goto out;
+    pathlen = snprintf(path, sizeof(path), "%s/%s", io->directory, name);
+    if (pathlen < 0 || pathlen >= sizeof(path))
+        return front_io_failure(io, name, "resolve backup file", 0, len, 0, ENAMETOOLONG, 0);
+    fd = openat(dirfd, name, (save ? O_RDWR | O_CREAT | O_EXCL : O_RDONLY) | O_NOFOLLOW, 0600);
+    if (fd < 0) return front_io_failure(io, path, "open", 0, len, 0, errno, 0);
     if (save)
     {
-        actual = write(fd, buffer, len);
-        if (actual != len)
-        {
-            if (actual >= 0) errno = EIO;
-            goto out;
-        }
-        if (fsync(fd)) goto out;
+        if (front_io_all(io, fd, path, 0, buffer, len, 1, 0) ||
+            front_sync(io, fd, path, 0, len, 0) ||
+            front_verify(io, fd, path, 0, buffer, len, 0)) goto out;
     }
     else
     {
-        if (fstat(fd, &st)) goto out;
+        if (fstat(fd, &st))
+        {
+            front_io_failure(io, path, "fstat", 0, len, 0, errno, 0);
+            goto out;
+        }
         if (!S_ISREG(st.st_mode) || st.st_size != len)
         {
-            errno = EINVAL;
+            front_io_failure(io, path, "validate file type and length", 0, len, 0, EINVAL, 0);
             goto out;
         }
-        actual = read(fd, buffer, len);
-        if (actual != len)
-        {
-            if (actual >= 0) errno = EIO;
-            goto out;
-        }
+        if (front_io_all(io, fd, path, 0, buffer, len, 0, 0)) goto out;
     }
     rc = 0;
 out:
-    if (rc) fprintf(stderr, "Cannot %s %s: %s\n", save ? "save" : "read", name, strerror(errno));
-    if (fd >= 0 && close(fd))
+    if (close(fd))
     {
-        fprintf(stderr, "Cannot close %s: %s\n", name, strerror(errno));
+        front_io_failure(io, path, "close", 0, len, 0, errno, 0);
         rc = 1;
     }
     return rc;
@@ -699,15 +812,23 @@ out:
 static int front_snapshot_save(char *disk, char *directory)
 {
     int fd = -1, dirfd = -1, rc = 1, i, style;
+    VTOY_FRONT_IO io = {"disk snapshot", disk, directory, 0};
     VTOY_FRONT_SNAPSHOT snapshot;
     fd = open(disk, O_RDONLY);
-    dirfd = open(directory, O_RDONLY | O_DIRECTORY);
-    if (fd < 0 || dirfd < 0 || front_read_snapshot(fd, &snapshot))
+    if (fd < 0)
     {
-        fprintf(stderr, "Cannot capture the selected disk identity; disk unchanged.\n");
+        front_io_failure(&io, disk, "open", 0, 0, 0, errno, 1);
         goto out;
     }
-    if (front_file(dirfd, "snapshot.bin", &snapshot, sizeof(snapshot), 1) || fsync(dirfd)) goto out;
+    dirfd = open(directory, O_RDONLY | O_DIRECTORY);
+    if (dirfd < 0)
+    {
+        front_io_failure(&io, directory, "open recovery directory", 0, 0, 0, errno, 0);
+        goto out;
+    }
+    if (front_read_snapshot(&io, fd, &snapshot) ||
+        front_file(&io, dirfd, "snapshot.bin", &snapshot, sizeof(snapshot), 1) ||
+        front_sync(&io, dirfd, directory, 0, 0, 0)) goto out;
     printf("Capacity: %.2f GiB (%llu bytes); current partition table: %s\n",
         (double)snapshot.bytes / (1024 * 1024 * 1024), snapshot.bytes,
         snapshot.table.MBR.PartTbl[0].FsFlag == 0xEE ? "GPT" : "MBR");
@@ -720,6 +841,8 @@ static int front_snapshot_save(char *disk, char *directory)
     }
     rc = 0;
 out:
+    if (rc)
+        fprintf(stderr, "Snapshot capture failed; the target disk was NOT written. Preparation directory: %s\n", directory);
     check_close(fd);
     check_close(dirfd);
     return rc;
@@ -728,16 +851,22 @@ out:
 static int front_partition(char *disk)
 {
     int fd, style, i;
-    UINT64 bytes = get_disk_size_in_byte(disk);
+    VTOY_FRONT_IO io = {"front partition precheck", disk, NULL, 0};
+    UINT64 bytes = 0;
     UINT64 first, available;
     VTOY_GPT_INFO gpt;
     fd = open(disk, O_RDONLY);
     if (fd < 0)
     {
-        fprintf(stderr, "Cannot open %s: %s\n", disk, strerror(errno));
+        front_io_failure(&io, disk, "open", 0, 0, 0, errno, 1);
         return 1;
     }
-    style = front_read_table(fd, bytes / 512, &gpt, 0, 1);
+    if (front_ioctl(&io, fd, BLKGETSIZE64, &bytes, "get disk size"))
+    {
+        close(fd);
+        return 1;
+    }
+    style = front_read_table(&io, fd, bytes / 512, &gpt, 0, 1);
     close(fd);
     if (style < 0) return 1;
     first = style ? gpt.PartTbl[0].StartLBA : gpt.MBR.PartTbl[0].StartSectorId;
@@ -789,10 +918,17 @@ static int front_efi_index(VTOY_GPT_INFO *gpt, int style)
 static int ventoy_layout(char *disk)
 {
     int fd, style, efi = -1;
+    UINT64 bytes = 0;
+    VTOY_FRONT_IO io = {"existing partition layout", disk, NULL, 0};
     VTOY_GPT_INFO gpt;
     fd = open(disk, O_RDONLY);
-    if (fd < 0) return 1;
-    style = front_read_table(fd, get_disk_size_in_byte(disk) / 512, &gpt, 1, 0);
+    if (fd < 0) return front_io_failure(&io, disk, "open", 0, 0, 0, errno, 1);
+    if (front_ioctl(&io, fd, BLKGETSIZE64, &bytes, "get disk size"))
+    {
+        close(fd);
+        return 1;
+    }
+    style = front_read_table(&io, fd, bytes / 512, &gpt, 1, 0);
     if (style >= 0) efi = front_efi_index(&gpt, style);
     close(fd);
     if (efi < 0) return 1;
@@ -800,7 +936,7 @@ static int ventoy_layout(char *disk)
     return 0;
 }
 
-static int front_commit_table(int fd, UINT64 bytes, VTOY_GPT_INFO *gpt, int style)
+static int front_commit_table(VTOY_FRONT_IO *io, int fd, UINT64 bytes, VTOY_GPT_INFO *gpt, int style)
 {
     int i, freeidx;
     VTOY_GPT_HDR backup;
@@ -826,9 +962,12 @@ static int front_commit_table(int fd, UINT64 bytes, VTOY_GPT_INFO *gpt, int styl
         backup.PartTblStartLBA = backup.EfiStartLBA - 32;
         backup.Crc = 0;
         backup.Crc = VtoyCrc32(&backup, backup.Length);
-        if (!WriteDataToPhyDisk(fd, backup.PartTblStartLBA * 512, gpt->PartTbl, sizeof(gpt->PartTbl)) ||
-            !WriteDataToPhyDisk(fd, backup.EfiStartLBA * 512, &backup, sizeof(backup)) || fsync(fd) ||
-            !WriteDataToPhyDisk(fd, 0, gpt, sizeof(*gpt))) return 1;
+        io->stage = "GPT backup partition table write/readback";
+        if (front_write_verify(io, fd, backup.PartTblStartLBA * 512, gpt->PartTbl, sizeof(gpt->PartTbl))) return 1;
+        io->stage = "GPT backup header write/readback";
+        if (front_write_verify(io, fd, backup.EfiStartLBA * 512, &backup, sizeof(backup))) return 1;
+        io->stage = "GPT primary partition table write/readback";
+        if (front_write_verify(io, fd, 0, gpt, sizeof(*gpt))) return 1;
     }
     else
     {
@@ -840,25 +979,8 @@ static int front_commit_table(int fd, UINT64 bytes, VTOY_GPT_INFO *gpt, int styl
         gpt->MBR.PartTbl[0].FsFlag = 0xEF;
         gpt->MBR.PartTbl[0].Active = 0x80;
         gpt->MBR.PartTbl[1].Active = 0;
-        if (!WriteDataToPhyDisk(fd, 0, &gpt->MBR, 512)) return 1;
-    }
-    return fsync(fd) ? 1 : 0;
-}
-
-static int front_write_verify(int fd, UINT64 offset, UINT8 *buffer, int len)
-{
-    int done, size;
-    UINT8 check[65536];
-    if (!WriteDataToPhyDisk(fd, offset, buffer, len) || fsync(fd)) return 1;
-    for (done = 0; done < len; done += size)
-    {
-        size = len - done > sizeof(check) ? sizeof(check) : len - done;
-        if (lseek(fd, offset + done, SEEK_SET) != offset + done ||
-            read(fd, check, size) != size || memcmp(check, buffer + done, size))
-        {
-            fprintf(stderr, "Disk readback verification failed at byte %llu.\n", offset + done);
-            return 1;
-        }
+        io->stage = "MBR partition table write/readback";
+        if (front_write_verify(io, fd, 0, &gpt->MBR, 512)) return 1;
     }
     return 0;
 }
@@ -866,23 +988,35 @@ static int front_write_verify(int fd, UINT64 offset, UINT8 *buffer, int len)
 static int front_transaction(char *disk, char *mode, char *directory)
 {
     int fd = -1, dirfd = -1, rc = 1, written = 0, backup_ready = 0;
-    int style, update, core_start, core_len, textlen;
+    int style, update, core_start, core_len, textlen, tail_len, markerfd = -1, marker_created = 0;
     UINT8 boot[512], tail[33 * 512];
     UINT8 *front = NULL, *core = NULL, *efi = NULL;
     VTOY_FRONT_SNAPSHOT expected, current;
     VTOY_GPT_INFO gpt, verify;
-    char fullpath[PATH_MAX], details[1024];
-    const char *step = "preparation";
+    char fullpath[PATH_MAX], marker_path[PATH_MAX], details[1024];
+    VTOY_FRONT_IO io = {"preparation", disk, fullpath, 0};
 
     update = !strcmp(mode, "update");
     if (!update && strcmp(mode, "install")) return 1;
     if (!realpath(directory, fullpath))
     {
+        front_io_failure(&io, directory, "resolve recovery directory", 0, 0, 0, errno, 0);
         fprintf(stderr, "Cannot resolve recovery directory. Target disk was NOT written.\n");
         return 1;
     }
+    textlen = snprintf(marker_path, sizeof(marker_path), "%s/backup.ready", fullpath);
+    if (textlen < 0 || textlen >= sizeof(marker_path))
+    {
+        front_io_failure(&io, fullpath, "resolve backup marker", 0, 0, 0, ENAMETOOLONG, 0);
+        goto out;
+    }
     dirfd = open(fullpath, O_RDONLY | O_DIRECTORY);
-    if (dirfd < 0 || front_file(dirfd, "snapshot.bin", &expected, sizeof(expected), 0)) goto out;
+    if (dirfd < 0)
+    {
+        front_io_failure(&io, fullpath, "open recovery directory", 0, 0, 0, errno, 0);
+        goto out;
+    }
+    if (front_file(&io, dirfd, "snapshot.bin", &expected, sizeof(expected), 0)) goto out;
     front = malloc(33 * SIZE_1MB);
     core = malloc(2047 * 512);
     efi = malloc(VENTOY_EFI_PART_SIZE);
@@ -891,38 +1025,58 @@ static int front_transaction(char *disk, char *mode, char *directory)
         fprintf(stderr, "Not enough memory to prepare the complete transaction.\n");
         goto out;
     }
-    if (front_file(dirfd, "boot.img", boot, sizeof(boot), 0) ||
-        front_file(dirfd, "core.img", core, 2047 * 512, 0) ||
-        front_file(dirfd, "efi.img", efi, VENTOY_EFI_PART_SIZE, 0)) goto out;
+    if (front_file(&io, dirfd, "boot.img", boot, sizeof(boot), 0) ||
+        front_file(&io, dirfd, "core.img", core, 2047 * 512, 0) ||
+        front_file(&io, dirfd, "efi.img", efi, VENTOY_EFI_PART_SIZE, 0)) goto out;
 
-    step = "exclusive disk access";
+    io.stage = "exclusive disk access";
     fd = open(disk, O_RDWR | O_EXCL);
     if (fd < 0)
     {
-        fprintf(stderr, "Cannot exclusively open %s: %s. Unmount its partitions, disable swap and stop RAID/device-mapper users.\n", disk, strerror(errno));
+        int error = errno;
+        front_io_failure(&io, disk, "open exclusive", 0, 0, 0, error, 1);
+        if (error == EBUSY)
+            fprintf(stderr, "Unmount the target partitions, disable swap and stop RAID/device-mapper users.\n");
         goto out;
     }
-    step = "disk identity and partition snapshot validation";
-    if (front_read_snapshot(fd, &current) || memcmp(&current, &expected, sizeof(current)))
+    io.stage = "disk identity and partition snapshot validation";
+    if (front_read_snapshot(&io, fd, &current)) goto out;
+    if (memcmp(&current, &expected, sizeof(current)))
     {
         fprintf(stderr, "The disk identity, size or partition table changed since confirmation.\n");
         goto out;
     }
-    style = front_read_table(fd, current.bytes / 512, &gpt, update, 1);
+    style = front_read_table(&io, fd, current.bytes / 512, &gpt, update, 1);
     if (style < 0 || (update && front_efi_index(&gpt, style) != 0)) goto out;
 
-    step = "persistent recovery backup";
-    if (lseek(fd, 0, SEEK_SET) != 0 || read(fd, front, 33 * SIZE_1MB) != 33 * SIZE_1MB ||
-        lseek(fd, current.bytes - sizeof(tail), SEEK_SET) != current.bytes - sizeof(tail) ||
-        read(fd, tail, sizeof(tail)) != sizeof(tail)) goto out;
-    if (front_file(dirfd, "front-33MiB.bin", front, 33 * SIZE_1MB, 1) ||
-        front_file(dirfd, "tail-33sectors.bin", tail, sizeof(tail), 1)) goto out;
+    io.stage = "persistent recovery backup";
+    tail_len = style ? sizeof(tail) : 0;
+    if (front_io_all(&io, fd, disk, 0, front, 33 * SIZE_1MB, 0, 1) ||
+        (tail_len && front_io_all(&io, fd, disk, current.bytes - tail_len, tail, tail_len, 0, 1))) goto out;
+    if (front_file(&io, dirfd, "front-33MiB.bin", front, 33 * SIZE_1MB, 1) ||
+        front_file(&io, dirfd, "tail-33sectors.bin", tail, tail_len, 1)) goto out;
     textlen = snprintf(details, sizeof(details),
-        "disk=%s\nbytes=%llu\ndevice=%llu\ndiskseq=%llu\noperation=%s\nfront_crc32=%08x\ntail_crc32=%08x\n",
+        "disk=%s\nbytes=%llu\ndevice=%llu\ndiskseq=%llu\noperation=%s\nfront_crc32=%08x\ntail_bytes=%d\ntail_crc32=%08x\n",
         disk, current.bytes, current.device, current.diskseq, mode,
-        VtoyCrc32(front, 33 * SIZE_1MB), VtoyCrc32(tail, sizeof(tail)));
-    if (textlen < 0 || textlen >= sizeof(details) || front_file(dirfd, "disk.txt", details, textlen, 1) ||
-        front_file(dirfd, "backup.ready", details, 0, 1) || fsync(dirfd)) goto out;
+        VtoyCrc32(front, 33 * SIZE_1MB), tail_len, VtoyCrc32(tail, tail_len));
+    if (textlen < 0 || textlen >= sizeof(details) || front_file(&io, dirfd, "disk.txt", details, textlen, 1) ||
+        front_sync(&io, dirfd, fullpath, 0, 0, 0)) goto out;
+    markerfd = openat(dirfd, "backup.ready", O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+    if (markerfd < 0)
+    {
+        front_io_failure(&io, marker_path, "create backup marker", 0, 0, 0, errno, 0);
+        goto out;
+    }
+    marker_created = 1;
+    if (front_sync(&io, markerfd, marker_path, 0, 0, 0)) goto out;
+    if (close(markerfd))
+    {
+        markerfd = -1;
+        front_io_failure(&io, marker_path, "close backup marker", 0, 0, 0, errno, 0);
+        goto out;
+    }
+    markerfd = -1;
+    if (front_sync(&io, dirfd, fullpath, 0, 0, 0)) goto out;
     backup_ready = 1;
     printf("Complete recovery backup: %s\n", fullpath);
     fflush(stdout);
@@ -941,8 +1095,9 @@ static int front_transaction(char *disk, char *mode, char *directory)
     }
     else
         ventoy_gen_preudo_uuid(boot + 384);
-    step = "final snapshot validation before writing";
-    if (front_read_snapshot(fd, &current) || memcmp(&current, &expected, sizeof(current)))
+    io.stage = "final snapshot validation before writing";
+    if (front_read_snapshot(&io, fd, &current)) goto out;
+    if (memcmp(&current, &expected, sizeof(current)))
     {
         fprintf(stderr, "The disk changed while preparing the backup.\n");
         goto out;
@@ -950,37 +1105,55 @@ static int front_transaction(char *disk, char *mode, char *directory)
 
     /* From here onward no files are created, and every disk access uses the same claimed device. */
     written = 1;
-    step = "EFI write/readback";
-    if (front_write_verify(fd, 2048 * 512ULL, efi, VENTOY_EFI_PART_SIZE)) goto out;
-    step = "BIOS core write/readback";
-    if (front_write_verify(fd, core_start * 512ULL, core, core_len)) goto out;
-    step = "boot code write/readback";
-    if (front_write_verify(fd, 0, boot, 440)) goto out;
+    io.stage = "EFI write/readback";
+    if (front_write_verify(&io, fd, 2048 * 512ULL, efi, VENTOY_EFI_PART_SIZE)) goto out;
+    io.stage = "BIOS core write/readback";
+    if (front_write_verify(&io, fd, core_start * 512ULL, core, core_len)) goto out;
+    io.stage = "boot code write/readback";
+    if (front_write_verify(&io, fd, 0, boot, 440)) goto out;
     memcpy(gpt.MBR.BootCode, boot, 440);
     if (!update)
     {
-        step = "partition table commit";
-        if (front_commit_table(fd, current.bytes, &gpt, style)) goto out;
+        io.stage = "partition table commit";
+        if (front_commit_table(&io, fd, current.bytes, &gpt, style)) goto out;
     }
-    step = "final partition verification";
-    if (front_read_table(fd, current.bytes / 512, &verify, 1, 1) != style ||
-        memcmp(&gpt, &verify, style ? sizeof(gpt) : sizeof(gpt.MBR)) || front_efi_index(&verify, style) != 0)
+    io.stage = "final partition verification";
+    if (front_read_table(&io, fd, current.bytes / 512, &verify, 1, 1) != style) goto out;
+    if (memcmp(&gpt, &verify, style ? sizeof(gpt) : sizeof(gpt.MBR)) || front_efi_index(&verify, style) != 0)
+    {
+        front_io_failure(&io, disk, "compare final partition layout", 0,
+            style ? sizeof(gpt) : sizeof(gpt.MBR), style ? sizeof(gpt) : sizeof(gpt.MBR), 0, 1);
         goto out;
+    }
     if (ioctl(fd, BLKRRPART))
         printf("Disk write verified, but the kernel could not refresh its partition table. Safely reconnect the disk before use.\n");
     printf("Front EFI %s finished and verified. Recovery files: %s\n", mode, fullpath);
     rc = 0;
 out:
+    if (markerfd >= 0 && close(markerfd))
+        front_io_failure(&io, marker_path, "close failed backup marker", 0, 0, 0, errno, 0);
+    if (marker_created && !backup_ready)
+    {
+        int cleanup_failed = 0;
+        if (unlinkat(dirfd, "backup.ready", 0))
+        {
+            front_io_failure(&io, marker_path, "remove failed backup marker", 0, 0, 0, errno, 0);
+            cleanup_failed = 1;
+        }
+        if (front_sync(&io, dirfd, fullpath, 0, 0, 0)) cleanup_failed = 1;
+        if (cleanup_failed)
+            fprintf(stderr, "The backup.ready marker in %s is NOT trustworthy. This operation did NOT write the target disk. Keep all recovery files for independent verification.\n", fullpath);
+    }
     if (rc)
     {
-        fprintf(stderr, "Front EFI failed during %s.\n", step);
+        fprintf(stderr, "Front EFI failed during %s.\n", io.stage);
         if (written)
         {
             fprintf(stderr, "The target disk WAS written and may need recovery. Complete backup: %s\nDo not format or run a normal install. Keep this folder and identify the original disk using disk.txt before restoring.\n", fullpath);
             rc = 3;
         }
         else
-            fprintf(stderr, "The target disk was NOT written. %s: %s\nResolve the error and retry the same front EFI command.\n",
+            fprintf(stderr, "The target disk was NOT written. %s: %s\nKeep these files and resolve the reported cause before any further disk operation.\n",
                 backup_ready ? "Complete recovery backup" : "Preparation files (backup may be incomplete)", fullpath);
     }
     check_close(fd);
@@ -1191,7 +1364,7 @@ int partresize_main(int argc, char **argv)
     
     if (argc == 2 && strcmp(argv[1], "--front-efi-api") == 0)
     {
-        puts("VTOY_FRONT_EFI_SAFE_V2");
+        puts("VTOY_FRONT_EFI_SAFE_V3");
         return 0;
     }
     if (argc != 3 && argc != 4 && argc != 5)

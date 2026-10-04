@@ -16,14 +16,14 @@ if [ "$1" = "FRONT_EFI" ]; then
         fi
     done
     if [ ! -f "$VTOY_PATH/INSTALL/Ventoy2Disk.exe" ] || \
-        ! grep -aFq VTOY_FRONT_EFI_SAFE_V2 "$VTOY_PATH/INSTALL/Ventoy2Disk.exe"; then
-        echo "FRONT_EFI requires a rebuilt Windows installer with VTOY_FRONT_EFI_SAFE_V2."
+        ! grep -aFq VTOY_FRONT_EFI_SAFE_V3 "$VTOY_PATH/INSTALL/Ventoy2Disk.exe"; then
+        echo "FRONT_EFI requires a rebuilt Windows installer with VTOY_FRONT_EFI_SAFE_V3."
         exit 1
     fi
     for front_file in "$VTOY_PATH/INSTALL"/Ventoy2Disk_*.exe; do
         [ -e "$front_file" ] || continue
-        if ! grep -aFq VTOY_FRONT_EFI_SAFE_V2 "$front_file"; then
-            echo "FRONT_EFI requires a rebuilt $front_file with VTOY_FRONT_EFI_SAFE_V2."
+        if ! grep -aFq VTOY_FRONT_EFI_SAFE_V3 "$front_file"; then
+            echo "FRONT_EFI requires a rebuilt $front_file with VTOY_FRONT_EFI_SAFE_V3."
             exit 1
         fi
     done
@@ -74,8 +74,8 @@ if [ "$1" = "FRONT_EFI" ]; then
     bash -e build.sh >> "$LOG" 2>&1 || exit 1
     for front_arch in i386 x86_64 aarch64 mips64el; do
         front_file="$VTOY_PATH/INSTALL/tool/$front_arch/vtoycli"
-        if [ ! -f "$front_file" ] || ! grep -aFq VTOY_FRONT_EFI_SAFE_V2 "$front_file"; then
-            echo "FRONT_EFI requires a rebuilt $front_file with VTOY_FRONT_EFI_SAFE_V2."
+        if [ ! -f "$front_file" ] || ! grep -aFq VTOY_FRONT_EFI_SAFE_V3 "$front_file"; then
+            echo "FRONT_EFI requires a rebuilt $front_file with VTOY_FRONT_EFI_SAFE_V3."
             exit 1
         fi
     done

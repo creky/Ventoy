@@ -23,6 +23,71 @@
 #include <limits.h>
 #include "Ventoy2Disk.h"
 
+void VentoyFrontRecordIoError(VTOY_FRONT_IO_ERROR *Error, BOOL IsDisk, const CHAR *Target,
+    const CHAR *Phase, const CHAR *Operation, UINT64 Offset, DWORD Requested,
+    DWORD Transferred, DWORD SystemError, BOOL Mismatch)
+{
+    BOOL nonMedia = FALSE;
+    if (!Error || Error->Valid) return;
+    switch (SystemError)
+    {
+    case ERROR_ACCESS_DENIED:
+    case ERROR_SHARING_VIOLATION:
+    case ERROR_LOCK_VIOLATION:
+    case ERROR_WRITE_PROTECT:
+    case ERROR_DISK_FULL:
+    case ERROR_HANDLE_DISK_FULL:
+    case ERROR_NOT_ENOUGH_MEMORY:
+    case ERROR_OUTOFMEMORY:
+        nonMedia = TRUE;
+        break;
+    }
+    Error->Valid = TRUE;
+    Error->IsDisk = IsDisk;
+    Error->StopWrites = Mismatch || !nonMedia;
+    Error->Mismatch = Mismatch;
+    Error->SystemError = SystemError;
+    Error->Requested = Requested;
+    Error->Transferred = Transferred;
+    Error->Offset = Offset;
+    safe_strcpy(Error->Phase, Phase);
+    safe_strcpy(Error->Operation, Operation);
+    safe_strcpy(Error->Target, Target);
+    Log("Front EFI I/O failure: target=%s phase=%s operation=%s offset=%llu requested=%lu transferred=%lu system_error=%lu mismatch=%d stop_writes=%d",
+        Target, Phase, Operation, Offset, Requested, Transferred, SystemError, Mismatch, Error->StopWrites);
+    if (IsDisk && Requested)
+        Log("Failed request covers LBA %llu through %llu; this is the requested range, not confirmed bad sectors.",
+            Offset / 512, (Offset + Requested - 1) / 512);
+}
+
+BOOL VentoyFrontRead(HANDLE Handle, VTOY_FRONT_IO_ERROR *Error, BOOL IsDisk, const CHAR *Target,
+    const CHAR *Phase, UINT64 Offset, VOID *Buffer, DWORD Length)
+{
+    LARGE_INTEGER pos, actual;
+    DWORD transferred = 0, code;
+    BOOL ok;
+    pos.QuadPart = Offset;
+    if (!SetFilePointerEx(Handle, pos, &actual, FILE_BEGIN))
+    {
+        code = GetLastError();
+        VentoyFrontRecordIoError(Error, IsDisk, Target, Phase, "seek", Offset, Length, 0, code, FALSE);
+        return FALSE;
+    }
+    if (actual.QuadPart != pos.QuadPart)
+    {
+        VentoyFrontRecordIoError(Error, IsDisk, Target, Phase, "seek mismatch", Offset, 0, 0, ERROR_SUCCESS, FALSE);
+        return FALSE;
+    }
+    ok = ReadFile(Handle, Buffer, Length, &transferred, NULL);
+    code = ok ? ERROR_SUCCESS : GetLastError();
+    if (!ok || transferred != Length)
+    {
+        VentoyFrontRecordIoError(Error, IsDisk, Target, Phase, "read", Offset, Length, transferred, code, FALSE);
+        return FALSE;
+    }
+    return TRUE;
+}
+
 BOOL VentoyCheckFrontLayout(const VTOY_GPT_INFO *Gpt, UINT64 DiskBytes, BOOL Installed, int *Reason)
 {
     int i, j, count = 0;
@@ -61,7 +126,7 @@ BOOL VentoyCheckFrontLayout(const VTOY_GPT_INFO *Gpt, UINT64 DiskBytes, BOOL Ins
             return FALSE;
         last = head.PartAreaEndLBA + 1;
         for (i = 1; i < 4; i++)
-            if (Gpt->MBR.PartTbl[i].SectorCount) return FALSE;
+            if (Gpt->MBR.PartTbl[i].FsFlag || Gpt->MBR.PartTbl[i].SectorCount) return FALSE;
     }
 
     for (i = 0; i < limit; i++)
@@ -73,6 +138,10 @@ BOOL VentoyCheckFrontLayout(const VTOY_GPT_INFO *Gpt, UINT64 DiskBytes, BOOL Ins
             if (!memcmp(&Gpt->PartTbl[i].PartGuid, &zero, sizeof(zero)) ||
                 Gpt->PartTbl[i].LastLBA >= last)
                 return FALSE;
+            for (j = 0; j < i; j++)
+                if (memcmp(&Gpt->PartTbl[j].PartType, &zero, sizeof(zero)) &&
+                    !memcmp(&Gpt->PartTbl[i].PartGuid, &Gpt->PartTbl[j].PartGuid, sizeof(GUID)))
+                    return FALSE;
             for (j = 0; j < sizeof(unsupported) / sizeof(unsupported[0]); j++)
                 if (!memcmp(&Gpt->PartTbl[i].PartType, &unsupported[j], sizeof(GUID)))
                 { *Reason = FRONT_ERR_UNSUPPORTED_DISK; return FALSE; }
@@ -186,13 +255,165 @@ out:
     return ok;
 }
 
+BOOL VentoyCheckFrontDataSignature(PHY_DRIVE_INFO *pPhyDrive, HANDLE Disk)
+{
+    BYTE boot[512];
+    CHAR target[64];
+    const char *fs = NULL;
+    WORD reserved, rootEntries, total16, fat16, version;
+    DWORD total32, fat32, rootCluster;
+    UINT64 total, fatSize, overhead, clusters;
+    static const GUID bitlocker = { 0x4967d63b, 0x2e29, 0x4ad8, { 0x83, 0x99, 0xf6, 0xa3, 0x39, 0xe3, 0xd0, 0x01 } };
+    static const GUID usedSpace = { 0x92a84d3b, 0xdd80, 0x4d0e, { 0x9e, 0x4e, 0xb1, 0xe3, 0x28, 0x4e, 0xae, 0xd8 } };
+
+    pPhyDrive->FrontEfiError = FRONT_ERR_DISK_CHANGED;
+    if (pPhyDrive->DataStartSector < 67584 ||
+        pPhyDrive->DataStartSector >= pPhyDrive->SizeInBytes / 512) return FALSE;
+    safe_sprintf(target, "\\\\.\\PhysicalDrive%d", pPhyDrive->PhyDrive);
+    pPhyDrive->FrontEfiError = FRONT_ERR_DISK_IO;
+    if (!VentoyFrontRead(Disk, &pPhyDrive->FrontIoError, TRUE, target, "data filesystem header",
+            pPhyDrive->DataStartSector * 512ULL, boot, sizeof(boot))) return FALSE;
+
+    /* BitLocker To Go can retain a FAT32-looking boot sector; its identifier is at 424. */
+    if (!memcmp(boot + 3, "-FVE-FS-", 8) || !memcmp(boot, "LUKS\xba\xbe", 6) ||
+        !memcmp(boot + 160, &bitlocker, sizeof(bitlocker)) ||
+        !memcmp(boot + 160, &usedSpace, sizeof(usedSpace)) ||
+        !memcmp(boot + 424, &bitlocker, sizeof(bitlocker)))
+    {
+        pPhyDrive->FrontEfiError = FRONT_ERR_ENCRYPTED;
+        Log("Front EFI data partition has an encrypted raw volume header.");
+        return FALSE;
+    }
+    pPhyDrive->FrontEfiError = FRONT_ERR_FILESYSTEM;
+    if (boot[510] != 0x55 || boot[511] != 0xAA) return FALSE;
+    if (!memcmp(boot + 3, "EXFAT   ", 8) && boot[108] == 9)
+        fs = "exFAT";
+    else if (boot[11] == 0 && boot[12] == 2)
+    {
+        if (!memcmp(boot + 3, "NTFS    ", 8)) fs = "NTFS";
+        else if (boot[13] && !(boot[13] & (boot[13] - 1)) && boot[16])
+        {
+            memcpy(&reserved, boot + 14, sizeof(reserved));
+            memcpy(&rootEntries, boot + 17, sizeof(rootEntries));
+            memcpy(&total16, boot + 19, sizeof(total16));
+            memcpy(&fat16, boot + 22, sizeof(fat16));
+            memcpy(&total32, boot + 32, sizeof(total32));
+            memcpy(&fat32, boot + 36, sizeof(fat32));
+            memcpy(&version, boot + 42, sizeof(version));
+            memcpy(&rootCluster, boot + 44, sizeof(rootCluster));
+            total = total16 ? total16 : total32;
+            fatSize = fat16 ? fat16 : fat32;
+            overhead = reserved + (UINT64)boot[16] * fatSize + ((UINT64)rootEntries * 32 + 511) / 512;
+            if (reserved && fatSize && total > overhead && total <= pPhyDrive->SizeInBytes / 512 - pPhyDrive->DataStartSector)
+            {
+                clusters = (total - overhead) / boot[13];
+                if (fat16 && rootEntries && clusters && clusters < 65525 &&
+                    fatSize * 512 >= ((clusters + 2) * (clusters < 4085 ? 12 : 16) + 7) / 8)
+                    fs = "FAT";
+                else if (!fat16 && !rootEntries && !version && clusters && clusters < 0x0ffffff5 &&
+                    rootCluster >= 2 && rootCluster < clusters + 2 && fatSize * 512 >= (clusters + 2) * 4)
+                    fs = "FAT32";
+            }
+        }
+    }
+    if (!fs || (pPhyDrive->FsName[0] && _stricmp(pPhyDrive->FsName, fs)))
+    {
+        Log("Front EFI data filesystem mismatch or unsupported raw header (Windows=%s raw=%s).",
+            pPhyDrive->FsName, fs ? fs : "unknown");
+        return FALSE;
+    }
+    safe_strcpy(pPhyDrive->FsName, fs);
+    pPhyDrive->FrontEfiError = FRONT_ERR_NONE;
+    return TRUE;
+}
+
+BOOL VentoyCheckFrontDataVolume(PHY_DRIVE_INFO *pPhyDrive, HANDLE Disk)
+{
+    HANDLE search = INVALID_HANDLE_VALUE, volume = INVALID_HANDLE_VALUE;
+    struct { DWORD NumberOfDiskExtents; DISK_EXTENT Extents[128]; } extents;
+    CHAR name[MAX_PATH], openName[MAX_PATH], rawFs[64], paths[1024], *path;
+    DWORD bytes, required;
+    UINT64 start, sectors;
+    int data, gpt;
+    BOOL rawOk, ok = FALSE;
+
+    pPhyDrive->Part1DriveLetter = 0;
+    pPhyDrive->ResizeVolumeGuid[0] = 0;
+    pPhyDrive->FsName[0] = 0;
+    rawOk = VentoyCheckFrontDataSignature(pPhyDrive, Disk);
+    if (!rawOk && pPhyDrive->FrontEfiError != FRONT_ERR_FILESYSTEM) return FALSE;
+    safe_strcpy(rawFs, pPhyDrive->FsName);
+    gpt = pPhyDrive->Gpt.MBR.PartTbl[0].FsFlag == 0xEE;
+    start = gpt ? pPhyDrive->Gpt.PartTbl[0].StartLBA : pPhyDrive->Gpt.MBR.PartTbl[0].StartSectorId;
+    data = start == pPhyDrive->DataStartSector ? 0 : 1;
+    start = gpt ? pPhyDrive->Gpt.PartTbl[data].StartLBA : pPhyDrive->Gpt.MBR.PartTbl[data].StartSectorId;
+    sectors = gpt ? pPhyDrive->Gpt.PartTbl[data].LastLBA - start + 1 : pPhyDrive->Gpt.MBR.PartTbl[data].SectorCount;
+    pPhyDrive->FrontEfiError = FRONT_ERR_DISK_CHANGED;
+    if (start != pPhyDrive->DataStartSector || !sectors || sectors > pPhyDrive->SizeInBytes / 512 - start) return FALSE;
+    pPhyDrive->FrontEfiError = FRONT_ERR_NO_VOLUME;
+    search = FindFirstVolumeA(name, sizeof(name));
+    if (search == INVALID_HANDLE_VALUE) goto out;
+    do
+    {
+        safe_strcpy(openName, name);
+        openName[strlen(openName) - 1] = 0;
+        volume = CreateFileA(openName, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+        if (volume == INVALID_HANDLE_VALUE) continue;
+        if (!DeviceIoControl(volume, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, NULL, 0,
+                &extents, sizeof(extents), &bytes, NULL) || extents.NumberOfDiskExtents != 1 ||
+            bytes < FIELD_OFFSET(VOLUME_DISK_EXTENTS, Extents) + sizeof(DISK_EXTENT) ||
+            extents.Extents[0].DiskNumber != (DWORD)pPhyDrive->PhyDrive ||
+            (UINT64)extents.Extents[0].StartingOffset.QuadPart != start * 512 ||
+            (UINT64)extents.Extents[0].ExtentLength.QuadPart != sectors * 512)
+        {
+            CHECK_CLOSE_HANDLE(volume);
+            continue;
+        }
+        CHECK_CLOSE_HANDLE(volume);
+        pPhyDrive->FrontEfiError = FRONT_ERR_FILESYSTEM;
+        if (!GetVolumeInformationA(name, NULL, 0, NULL, NULL, NULL, pPhyDrive->FsName, sizeof(pPhyDrive->FsName)))
+        {
+            DWORD code = GetLastError();
+            VentoyFrontRecordIoError(&pPhyDrive->FrontIoError, TRUE, name, "data volume filesystem", "query", 0, 0, 0, code, FALSE);
+            Log("Cannot query the actual data volume %s: %u", name, code);
+            goto out;
+        }
+        if (!rawOk || _stricmp(pPhyDrive->FsName, rawFs))
+        {
+            Log("Unsupported or encrypted data filesystem on %s: Windows=%s raw=%s", name, pPhyDrive->FsName, rawFs);
+            goto out;
+        }
+        if (strlen(name) >= sizeof(pPhyDrive->ResizeVolumeGuid)) goto out;
+        safe_strcpy(pPhyDrive->ResizeVolumeGuid, name);
+        if (GetVolumePathNamesForVolumeNameA(name, paths, sizeof(paths), &required))
+            for (path = paths; *path; path += strlen(path) + 1)
+                if (strlen(path) == 3 && path[1] == ':' && path[2] == '\\')
+                {
+                    pPhyDrive->Part1DriveLetter = path[0];
+                    break;
+                }
+        Log("Front EFI data volume: %s letter=%c filesystem=%s offset=%llu length=%llu", name,
+            pPhyDrive->Part1DriveLetter ? pPhyDrive->Part1DriveLetter : '-', pPhyDrive->FsName, start * 512, sectors * 512);
+        pPhyDrive->FrontEfiError = FRONT_ERR_NONE;
+        ok = TRUE;
+        break;
+    } while (FindNextVolumeA(search, name, sizeof(name)));
+out:
+    CHECK_CLOSE_HANDLE(volume);
+    if (search != INVALID_HANDLE_VALUE) FindVolumeClose(search);
+    return ok;
+}
+
 BOOL VentoyPrepareFrontUpdate(PHY_DRIVE_INFO *pPhyDrive)
 {
     HANDLE disk = INVALID_HANDLE_VALUE;
     VTOY_GPT_INFO table;
-    DWORD bytes;
+    CHAR target[64];
     BOOL ok = FALSE;
 
+    memset(&pPhyDrive->FrontIoError, 0, sizeof(pPhyDrive->FrontIoError));
+    memset(&pPhyDrive->FrontRestoreIoError, 0, sizeof(pPhyDrive->FrontRestoreIoError));
+    safe_sprintf(target, "\\\\.\\PhysicalDrive%d", pPhyDrive->PhyDrive);
     pPhyDrive->FrontEfiState = FRONT_STATE_UNTOUCHED;
     pPhyDrive->FrontBackupPath[0] = 0;
     pPhyDrive->FrontEfiError = FRONT_ERR_SECTOR;
@@ -201,14 +422,20 @@ BOOL VentoyPrepareFrontUpdate(PHY_DRIVE_INFO *pPhyDrive)
     if (!VentoyCheckFrontEfiPackage()) return FALSE;
     pPhyDrive->FrontEfiError = FRONT_ERR_DISK_CHANGED;
     if (!VentoyPhydriveMatch(pPhyDrive)) return FALSE;
-    disk = GetPhysicalHandle(pPhyDrive->PhyDrive, FALSE, FALSE, FALSE);
-    if (disk == INVALID_HANDLE_VALUE) return FALSE;
+    disk = CreateFileA(target, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    if (disk == INVALID_HANDLE_VALUE)
+    {
+        VentoyFrontRecordIoError(&pPhyDrive->FrontIoError, TRUE, target, "update precheck", "open", 0, 0, 0, GetLastError(), FALSE);
+        return FALSE;
+    }
     pPhyDrive->FrontEfiError = FRONT_ERR_DISK_IO;
-    if (!ReadFile(disk, &table, sizeof(table), &bytes, NULL) || bytes != sizeof(table)) goto out;
+    if (!VentoyFrontRead(disk, &pPhyDrive->FrontIoError, TRUE, target, "update partition precheck", 0, &table, sizeof(table))) goto out;
     pPhyDrive->FrontEfiError = FRONT_ERR_DISK_CHANGED;
     if (memcmp(&table.MBR, &pPhyDrive->MBR, sizeof(table.MBR))) goto out;
     if (!VentoyCheckFrontLayout(&table, pPhyDrive->SizeInBytes, TRUE, &pPhyDrive->FrontEfiError)) goto out;
     pPhyDrive->Gpt = table;
+    pPhyDrive->DataStartSector = table.MBR.PartTbl[0].FsFlag == 0xEE ? table.PartTbl[1].StartLBA : table.MBR.PartTbl[1].StartSectorId;
+    if (!VentoyCheckFrontDataVolume(pPhyDrive, disk)) goto out;
     ok = TRUE;
 out:
     CHECK_CLOSE_HANDLE(disk);

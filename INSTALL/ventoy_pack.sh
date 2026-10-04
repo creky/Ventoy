@@ -85,11 +85,11 @@ for front_file in ./ventoy/ventoy_x64.efi ./ventoy/ventoy_ia32.efi ./ventoy/vent
 done
 for front_file in ./Ventoy2Disk.exe \
     ./tool/i386/vtoycli ./tool/x86_64/vtoycli ./tool/aarch64/vtoycli ./tool/mips64el/vtoycli; do
-    front_efi_binary "$front_file" VTOY_FRONT_EFI_SAFE_V2
+    front_efi_binary "$front_file" VTOY_FRONT_EFI_SAFE_V3
 done
 for front_file in ./Ventoy2Disk_*.exe; do
     [ -e "$front_file" ] || continue
-    front_efi_binary "$front_file" VTOY_FRONT_EFI_SAFE_V2
+    front_efi_binary "$front_file" VTOY_FRONT_EFI_SAFE_V3
 done
 
 if [ "$1" = "FRONT_EFI" ] && [ "$front_efi_ready" != "1" ]; then

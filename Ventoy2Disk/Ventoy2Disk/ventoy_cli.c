@@ -596,6 +596,37 @@ static void CLI_WriteDoneFile(int ret)
         }
         fclose(File);
     }
+    else
+    {
+        Log("[ERROR] Cannot write CLI completion status: %s", VENTOY_CLI_DONE);
+    }
+}
+
+BOOL CLI_InitStatus(void)
+{
+    const char* files[] = { VENTOY_CLI_PERCENT, VENTOY_CLI_DONE };
+    int i;
+    DWORD error;
+
+    for (i = 0; i < sizeof(files) / sizeof(files[0]); i++)
+    {
+        if (!DeleteFileA(files[i]))
+        {
+            error = GetLastError();
+            if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND)
+            {
+                Log("[ERROR] Cannot clear previous CLI status %s: %u", files[i], error);
+                return FALSE;
+            }
+        }
+    }
+    return TRUE;
+}
+
+void CLI_FinishStatus(int ret)
+{
+    CLI_UpdatePercent(PT_FINISH);
+    CLI_WriteDoneFile(ret);
 }
 
 PHY_DRIVE_INFO* CLI_PhyDrvInfo(void)
@@ -612,9 +643,6 @@ int VentoyCLIMain(int argc, char** argv)
     int ret = 1;
     PHY_DRIVE_INFO* pDrvInfo = NULL;
     CLI_CFG CliCfg;
-
-    DeleteFileA(VENTOY_CLI_PERCENT);
-    DeleteFileA(VENTOY_CLI_DONE);
 
     g_CLI_PhyDrvInfo = pDrvInfo = (PHY_DRIVE_INFO*)malloc(sizeof(PHY_DRIVE_INFO));
     if (!pDrvInfo)
@@ -666,8 +694,7 @@ end:
     g_CLI_PhyDrvInfo = NULL;
     CHECK_FREE(pDrvInfo);
 
-    CLI_UpdatePercent(PT_FINISH);
-    CLI_WriteDoneFile(ret);
+    CLI_FinishStatus(ret);
 
     return ret;
 }

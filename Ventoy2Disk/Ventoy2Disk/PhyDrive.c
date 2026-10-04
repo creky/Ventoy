@@ -20,6 +20,7 @@
  */
  
 #include <Windows.h>
+#include <wincrypt.h>
 #include <time.h>
 #include <winternl.h>
 #include <commctrl.h>
@@ -2064,14 +2065,87 @@ End:
 }
 
 
+typedef struct VTOY_FRONT_CHANGED_RANGE
+{
+    UINT64 Offset;
+    DWORD Length;
+    const BYTE *Original;
+} VTOY_FRONT_CHANGED_RANGE;
+
+static BOOL FrontWriteVerify(HANDLE Handle, VTOY_FRONT_IO_ERROR *Error, BOOL IsDisk,
+    const CHAR *Target, const CHAR *Phase, UINT64 Offset, const BYTE *Buffer,
+    DWORD Length, BYTE *Check, BOOL *Attempted)
+{
+    LARGE_INTEGER pos, actual;
+    DWORD transferred = 0, code, done, size;
+    BOOL ok;
+    if (Attempted) *Attempted = FALSE;
+    pos.QuadPart = Offset;
+    if (!SetFilePointerEx(Handle, pos, &actual, FILE_BEGIN))
+    {
+        code = GetLastError();
+        VentoyFrontRecordIoError(Error, IsDisk, Target, Phase, "seek", Offset, Length, 0, code, FALSE);
+        return FALSE;
+    }
+    if (actual.QuadPart != pos.QuadPart)
+    {
+        VentoyFrontRecordIoError(Error, IsDisk, Target, Phase, "seek mismatch", Offset, 0, 0, ERROR_SUCCESS, FALSE);
+        return FALSE;
+    }
+    if (Attempted) *Attempted = TRUE;
+    ok = WriteFile(Handle, Buffer, Length, &transferred, NULL);
+    code = ok ? ERROR_SUCCESS : GetLastError();
+    if (!ok || transferred != Length)
+    {
+        VentoyFrontRecordIoError(Error, IsDisk, Target, Phase, "write", Offset, Length, transferred, code, FALSE);
+        return FALSE;
+    }
+    if (!FlushFileBuffers(Handle))
+    {
+        code = GetLastError();
+        /* The range describes the preceding write, not a localized failure inside it. */
+        VentoyFrontRecordIoError(Error, IsDisk, Target, Phase, "flush", Offset, Length, transferred, code, FALSE);
+        return FALSE;
+    }
+    for (done = 0; done < Length; done += size)
+    {
+        size = min(SIZE_1MB, Length - done);
+        if (!VentoyFrontRead(Handle, Error, IsDisk, Target, Phase, Offset + done, Check, size)) return FALSE;
+        if (memcmp(Check, Buffer + done, size))
+        {
+            VentoyFrontRecordIoError(Error, IsDisk, Target, Phase, "verify", Offset + done, size, size, ERROR_SUCCESS, TRUE);
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+static BOOL FrontWriteDiskRange(PHY_DRIVE_INFO *Drive, HANDLE Disk, const CHAR *Target,
+    const CHAR *Phase, UINT64 Offset, const BYTE *Buffer, DWORD Length, const BYTE *Original,
+    BYTE *Check, VTOY_FRONT_CHANGED_RANGE *Ranges, int *RangeCount)
+{
+    BOOL attempted, ok;
+    Ranges[*RangeCount].Offset = Offset;
+    Ranges[*RangeCount].Length = Length;
+    Ranges[*RangeCount].Original = Original;
+    (*RangeCount)++;
+    ok = FrontWriteVerify(Disk, &Drive->FrontIoError, TRUE, Target, Phase, Offset, Buffer, Length, Check, &attempted);
+    if (!attempted) (*RangeCount)--;
+    if (*RangeCount) Drive->FrontEfiState = FRONT_STATE_CHANGED;
+    return ok;
+}
+
 static int WriteFrontEfi(PHY_DRIVE_INFO *pPhyDrive, BOOL Updating)
 {
-    int i, j, count = 0, rc = 1;
-    DWORD bytes, size, ignored;
-    BOOL gpt, changed = FALSE, imagePrepared = FALSE;
+    int i, j, count = 0, rc = 1, rangeCount = 0;
+    DWORD bytes, size, ignored, signature, digestSize, done, code;
+    int textSize, wideSize, utf8Size;
+    BOOL gpt, imagePrepared = FALSE;
     HANDLE disk = INVALID_HANDLE_VALUE, backup = INVALID_HANDLE_VALUE;
     HANDLE search = INVALID_HANDLE_VALUE, volume = INVALID_HANDLE_VALUE;
-    HANDLE backupDir = INVALID_HANDLE_VALUE;
+    HANDLE backupDir = INVALID_HANDLE_VALUE, metadataFile = INVALID_HANDLE_VALUE;
+    HCRYPTPROV provider = 0;
+    HCRYPTHASH hash = 0;
     HANDLE locked[128];
     struct { DWORD NumberOfDiskExtents; DISK_EXTENT Extents[128]; } volumes;
     STORAGE_DEVICE_NUMBER device;
@@ -2084,12 +2158,18 @@ static int WriteFrontEfi(PHY_DRIVE_INFO *pPhyDrive, BOOL Updating)
     const DWORD frontBytes = 33 * SIZE_1MB;
     DWORD tailBytes = 0;
     UINT64 tailOffset;
-    LARGE_INTEGER pos;
     char volumeName[MAX_PATH], diskName[64], backupName[MAX_PATH] = { 0 }, directory[MAX_PATH];
     char finalDirectory[MAX_PATH], *volumeEnd;
     ULARGE_INTEGER freeBytes;
+    SYSTEMTIME timestamp;
+    BYTE digest[32];
+    CHAR metadataName[MAX_PATH + 4], metadata[4096], utf8[12288], sha256[65], diskGuid[64];
+    WCHAR metadataWide[4096];
+    VTOY_FRONT_CHANGED_RANGE ranges[VENTOY_EFI_PART_SIZE / SIZE_1MB + 4];
 
-    Log("VTOY_FRONT_EFI_V1 VTOY_FRONT_EFI_SAFE_V2: %s", Updating ? "update" : "install");
+    Log("VTOY_FRONT_EFI_V1 VTOY_FRONT_EFI_SAFE_V3: %s", Updating ? "update" : "install");
+    memset(&pPhyDrive->FrontIoError, 0, sizeof(pPhyDrive->FrontIoError));
+    memset(&pPhyDrive->FrontRestoreIoError, 0, sizeof(pPhyDrive->FrontRestoreIoError));
     pPhyDrive->FrontEfiError = FRONT_ERR_SECTOR;
     pPhyDrive->FrontEfiState = FRONT_STATE_UNTOUCHED;
     pPhyDrive->FrontBackupPath[0] = 0;
@@ -2099,21 +2179,43 @@ static int WriteFrontEfi(PHY_DRIVE_INFO *pPhyDrive, BOOL Updating)
 
     pPhyDrive->FrontEfiError = FRONT_ERR_BACKUP_LOCATION;
     size = GetFullPathNameA(".\\ventoy", sizeof(directory), directory, NULL);
-    if (!size || size >= sizeof(directory)) goto out;
+    if (!size || size >= sizeof(directory))
+    {
+        VentoyFrontRecordIoError(&pPhyDrive->FrontIoError, FALSE, ".\\ventoy", "backup location", "resolve", 0, 0, 0,
+            size ? ERROR_INSUFFICIENT_BUFFER : GetLastError(), FALSE);
+        goto out;
+    }
     backupDir = CreateFileA(directory, FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE,
         NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
-    if (backupDir == INVALID_HANDLE_VALUE) goto out;
+    if (backupDir == INVALID_HANDLE_VALUE)
+    {
+        VentoyFrontRecordIoError(&pPhyDrive->FrontIoError, FALSE, directory, "backup location", "open", 0, 0, 0, GetLastError(), FALSE);
+        goto out;
+    }
     size = GetFinalPathNameByHandleA(backupDir, finalDirectory, sizeof(finalDirectory), VOLUME_NAME_GUID);
-    if (!size || size >= sizeof(finalDirectory)) goto out;
+    if (!size || size >= sizeof(finalDirectory))
+    {
+        VentoyFrontRecordIoError(&pPhyDrive->FrontIoError, FALSE, directory, "backup location", "resolve", 0, 0, 0,
+            size ? ERROR_INSUFFICIENT_BUFFER : GetLastError(), FALSE);
+        goto out;
+    }
     safe_strcpy(volumeName, finalDirectory);
     volumeEnd = strstr(volumeName, "}\\");
     if (!volumeEnd) goto out;
     volumeEnd[1] = 0;
     volume = CreateFileA(volumeName, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
-    if (volume == INVALID_HANDLE_VALUE ||
-        !DeviceIoControl(volume, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, NULL, 0,
-            &volumes, sizeof(volumes), &bytes, NULL) || !volumes.NumberOfDiskExtents ||
-        volumes.NumberOfDiskExtents > 128 ||
+    if (volume == INVALID_HANDLE_VALUE)
+    {
+        VentoyFrontRecordIoError(&pPhyDrive->FrontIoError, FALSE, volumeName, "backup volume location", "open", 0, 0, 0, GetLastError(), FALSE);
+        goto out;
+    }
+    bytes = 0;
+    if (!DeviceIoControl(volume, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, NULL, 0, &volumes, sizeof(volumes), &bytes, NULL))
+    {
+        VentoyFrontRecordIoError(&pPhyDrive->FrontIoError, FALSE, volumeName, "backup volume location", "query", 0, sizeof(volumes), bytes, GetLastError(), FALSE);
+        goto out;
+    }
+    if (!volumes.NumberOfDiskExtents || volumes.NumberOfDiskExtents > 128 ||
         bytes < FIELD_OFFSET(VOLUME_DISK_EXTENTS, Extents) + volumes.NumberOfDiskExtents * sizeof(DISK_EXTENT)) goto out;
     for (i = 0; i < (int)volumes.NumberOfDiskExtents; i++)
         if (volumes.Extents[i].DiskNumber == (DWORD)pPhyDrive->PhyDrive) goto out;
@@ -2122,15 +2224,41 @@ static int WriteFrontEfi(PHY_DRIVE_INFO *pPhyDrive, BOOL Updating)
     safe_sprintf(backupName, "%s\\front-efi-disk%d-%lu-%llu.bin", finalDirectory,
         pPhyDrive->PhyDrive, GetCurrentProcessId(), GetTickCount64());
 
+    safe_sprintf(diskName, "\\\\.\\PhysicalDrive%d", pPhyDrive->PhyDrive);
+    pPhyDrive->FrontEfiError = FRONT_ERR_DISK_CHANGED;
+    disk = CreateFileA(diskName, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ,
+        NULL, OPEN_EXISTING, FILE_FLAG_WRITE_THROUGH, NULL);
+    if (disk == INVALID_HANDLE_VALUE)
+    {
+        VentoyFrontRecordIoError(&pPhyDrive->FrontIoError, TRUE, diskName, "exclusive disk access", "open", 0, 0, 0, GetLastError(), FALSE);
+        goto out;
+    }
+    if (!VentoyPhydriveMatchHandle(pPhyDrive, disk)) goto out;
+    pPhyDrive->FrontEfiError = FRONT_ERR_DISK_IO;
+    if (!VentoyFrontRead(disk, &pPhyDrive->FrontIoError, TRUE, diskName, "partition snapshot", 0, &table, sizeof(table))) goto out;
+    pPhyDrive->FrontEfiError = FRONT_ERR_DISK_CHANGED;
+    if (memcmp(&table, &pPhyDrive->Gpt, sizeof(table)))
+    {
+        Log("Disk identity or partition table changed after confirmation; stopped before writing.");
+        goto out;
+    }
+    if (!VentoyCheckFrontLayout(&table, pPhyDrive->SizeInBytes, Updating, &pPhyDrive->FrontEfiError)) goto out;
+    if (!VentoyCheckFrontDataVolume(pPhyDrive, disk)) goto out;
+
     pPhyDrive->FrontEfiError = FRONT_ERR_VOLUME_QUERY;
     search = FindFirstVolumeA(volumeName, sizeof(volumeName));
-    if (search == INVALID_HANDLE_VALUE) goto out;
+    if (search == INVALID_HANDLE_VALUE)
+    {
+        VentoyFrontRecordIoError(&pPhyDrive->FrontIoError, TRUE, diskName, "volume enumeration", "query", 0, 0, 0, GetLastError(), FALSE);
+        goto out;
+    }
     do
     {
         volumeName[strlen(volumeName) - 1] = 0;
         volume = CreateFileA(volumeName, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
         if (volume == INVALID_HANDLE_VALUE)
         {
+            VentoyFrontRecordIoError(&pPhyDrive->FrontIoError, TRUE, volumeName, "volume enumeration", "open", 0, 0, 0, GetLastError(), FALSE);
             Log("Cannot enumerate a volume safely; front EFI operation stopped.");
             goto out;
         }
@@ -2138,10 +2266,12 @@ static int WriteFrontEfi(PHY_DRIVE_INFO *pPhyDrive, BOOL Updating)
         if (!DeviceIoControl(volume, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, NULL, 0,
                 &volumes, sizeof(volumes), &size, NULL))
         {
+            code = GetLastError();
             if (!DeviceIoControl(volume, IOCTL_STORAGE_GET_DEVICE_NUMBER, NULL, 0,
                     &device, sizeof(device), &size, NULL) || size < sizeof(device) ||
                 (device.DeviceType == FILE_DEVICE_DISK && device.DeviceNumber == (DWORD)pPhyDrive->PhyDrive))
             {
+                VentoyFrontRecordIoError(&pPhyDrive->FrontIoError, TRUE, volumeName, "volume ownership", "query-extents", 0, sizeof(volumes), 0, code, FALSE);
                 Log("Cannot establish volume ownership; front EFI operation stopped.");
                 goto out;
             }
@@ -2167,11 +2297,19 @@ static int WriteFrontEfi(PHY_DRIVE_INFO *pPhyDrive, BOOL Updating)
         volume = CreateFileA(volumeName, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
             NULL, OPEN_EXISTING, FILE_FLAG_WRITE_THROUGH, NULL);
         pPhyDrive->FrontEfiError = FRONT_ERR_VOLUME_BUSY;
-        if (volume == INVALID_HANDLE_VALUE ||
-            !DeviceIoControl(volume, FSCTL_LOCK_VOLUME, NULL, 0, NULL, 0, &ignored, NULL) ||
-            !DeviceIoControl(volume, FSCTL_DISMOUNT_VOLUME, NULL, 0, NULL, 0, &ignored, NULL))
+        if (volume == INVALID_HANDLE_VALUE)
         {
-            Log("Cannot exclusively lock a volume; front EFI operation stopped.");
+            VentoyFrontRecordIoError(&pPhyDrive->FrontIoError, TRUE, volumeName, "lock target volumes", "open", 0, 0, 0, GetLastError(), FALSE);
+            goto out;
+        }
+        if (!DeviceIoControl(volume, FSCTL_LOCK_VOLUME, NULL, 0, NULL, 0, &ignored, NULL))
+        {
+            VentoyFrontRecordIoError(&pPhyDrive->FrontIoError, TRUE, volumeName, "lock target volumes", "lock", 0, 0, 0, GetLastError(), FALSE);
+            goto out;
+        }
+        if (!DeviceIoControl(volume, FSCTL_DISMOUNT_VOLUME, NULL, 0, NULL, 0, &ignored, NULL))
+        {
+            VentoyFrontRecordIoError(&pPhyDrive->FrontIoError, TRUE, volumeName, "lock target volumes", "dismount", 0, 0, 0, GetLastError(), FALSE);
             goto out;
         }
         locked[count] = volume;
@@ -2179,46 +2317,43 @@ static int WriteFrontEfi(PHY_DRIVE_INFO *pPhyDrive, BOOL Updating)
         volume = INVALID_HANDLE_VALUE;
         pPhyDrive->FrontEfiError = FRONT_ERR_VOLUME_QUERY;
     } while (FindNextVolumeA(search, volumeName, sizeof(volumeName)));
-    if (GetLastError() != ERROR_NO_MORE_FILES) goto out;
+    code = GetLastError();
+    if (code != ERROR_NO_MORE_FILES)
+    {
+        VentoyFrontRecordIoError(&pPhyDrive->FrontIoError, TRUE, diskName, "volume enumeration", "query", 0, 0, 0, code, FALSE);
+        goto out;
+    }
     FindVolumeClose(search);
     search = INVALID_HANDLE_VALUE;
 
-    safe_sprintf(diskName, "\\\\.\\PhysicalDrive%d", pPhyDrive->PhyDrive);
-    pPhyDrive->FrontEfiError = FRONT_ERR_DISK_CHANGED;
-    disk = CreateFileA(diskName, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ,
-        NULL, OPEN_EXISTING, FILE_FLAG_WRITE_THROUGH, NULL);
-    if (disk == INVALID_HANDLE_VALUE) goto out;
-    if (!VentoyPhydriveMatchHandle(pPhyDrive, disk)) goto out;
-    pPhyDrive->FrontEfiError = FRONT_ERR_DISK_IO;
-    if (!ReadFile(disk, &table, sizeof(table), &bytes, NULL) || bytes != sizeof(table)) goto out;
-    pPhyDrive->FrontEfiError = FRONT_ERR_DISK_CHANGED;
-    if (memcmp(&table, &pPhyDrive->Gpt, sizeof(table)))
-    {
-        Log("Disk identity or partition table changed after confirmation; stopped before writing.");
-        goto out;
-    }
-    if (!VentoyCheckFrontLayout(&table, pPhyDrive->SizeInBytes, Updating, &pPhyDrive->FrontEfiError)) goto out;
     gpt = table.MBR.PartTbl[0].FsFlag == 0xEE;
     tailBytes = gpt ? 33 * 512 : 0;
     tailOffset = pPhyDrive->SizeInBytes - tailBytes;
     pPhyDrive->FrontEfiError = FRONT_ERR_BACKUP_LOCATION;
-    if (!GetDiskFreeSpaceExA(finalDirectory, &freeBytes, NULL, NULL)) goto out;
+    if (!GetDiskFreeSpaceExA(finalDirectory, &freeBytes, NULL, NULL))
+    {
+        VentoyFrontRecordIoError(&pPhyDrive->FrontIoError, FALSE, finalDirectory, "backup free space", "query", 0, 0, 0, GetLastError(), FALSE);
+        goto out;
+    }
     pPhyDrive->FrontEfiError = FRONT_ERR_BACKUP_IO;
-    if (freeBytes.QuadPart < (UINT64)frontBytes + tailBytes) goto out;
+    if (freeBytes.QuadPart < (UINT64)frontBytes + tailBytes + sizeof(utf8))
+    {
+        VentoyFrontRecordIoError(&pPhyDrive->FrontIoError, FALSE, finalDirectory, "backup free space", "check", 0,
+            frontBytes + tailBytes + sizeof(utf8), 0, ERROR_DISK_FULL, FALSE);
+        goto out;
+    }
     pPhyDrive->FrontEfiError = FRONT_ERR_MEMORY;
     saved = malloc(frontBytes + tailBytes);
     check = malloc(SIZE_1MB);
     if (!saved || !check) goto out;
     pPhyDrive->FrontEfiError = FRONT_ERR_DISK_IO;
-    pos.QuadPart = 0;
-    if (!SetFilePointerEx(disk, pos, NULL, FILE_BEGIN) ||
-        !ReadFile(disk, saved, frontBytes, &bytes, NULL) || bytes != frontBytes) goto out;
+    for (done = 0; done < frontBytes; done += SIZE_1MB)
+        if (!VentoyFrontRead(disk, &pPhyDrive->FrontIoError, TRUE, diskName, "read front backup", done, saved + done, SIZE_1MB)) goto out;
     if (gpt)
     {
         VTOY_GPT_HDR head;
-        pos.QuadPart = tailOffset;
-        if (!SetFilePointerEx(disk, pos, NULL, FILE_BEGIN) ||
-            !ReadFile(disk, saved + frontBytes, tailBytes, &bytes, NULL) || bytes != tailBytes) goto out;
+        if (!VentoyFrontRead(disk, &pPhyDrive->FrontIoError, TRUE, diskName, "read GPT backup", tailOffset,
+                saved + frontBytes, tailBytes)) goto out;
         memcpy(&head, saved + frontBytes + 32 * 512, sizeof(head));
         VentoyFillBackupGptHead(&table, &backupHead);
         if (memcmp(&head, &backupHead, sizeof(head)) ||
@@ -2230,13 +2365,60 @@ static int WriteFrontEfi(PHY_DRIVE_INFO *pPhyDrive, BOOL Updating)
         }
     }
     pPhyDrive->FrontEfiError = FRONT_ERR_BACKUP_IO;
-    backup = CreateFileA(backupName, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_FLAG_WRITE_THROUGH, NULL);
-    if (backup == INVALID_HANDLE_VALUE ||
-        !WriteFile(backup, saved, frontBytes + tailBytes, &bytes, NULL) || bytes != frontBytes + tailBytes ||
-        !FlushFileBuffers(backup)) goto out;
+    backup = CreateFileA(backupName, GENERIC_READ | GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_FLAG_WRITE_THROUGH, NULL);
+    if (backup == INVALID_HANDLE_VALUE)
+    {
+        VentoyFrontRecordIoError(&pPhyDrive->FrontIoError, FALSE, backupName, "save recovery backup", "create", 0, 0, 0, GetLastError(), FALSE);
+        goto out;
+    }
+    if (!FrontWriteVerify(backup, &pPhyDrive->FrontIoError, FALSE, backupName, "save recovery backup", 0,
+            saved, frontBytes + tailBytes, check, NULL)) goto out;
     CHECK_CLOSE_HANDLE(backup);
+    pPhyDrive->FrontEfiError = FRONT_ERR_BACKUP_METADATA;
+    if (!CryptAcquireContext(&provider, NULL, NULL, PROV_RSA_AES, CRYPT_VERIFYCONTEXT) ||
+        !CryptCreateHash(provider, CALG_SHA_256, 0, 0, &hash) ||
+        !CryptHashData(hash, saved, frontBytes + tailBytes, 0)) goto out;
+    digestSize = sizeof(digest);
+    if (!CryptGetHashParam(hash, HP_HASHVAL, digest, &digestSize, 0) || digestSize != sizeof(digest)) goto out;
+    for (i = 0; i < (int)sizeof(digest); i++) sprintf_s(sha256 + i * 2, 3, "%02x", digest[i]);
+    memcpy(&signature, table.MBR.BootCode + 440, sizeof(signature));
+    if (gpt) GUID2String(&table.Head.DiskGuid, diskGuid, sizeof(diskGuid));
+    else safe_strcpy(diskGuid, "none");
+    GetSystemTime(&timestamp);
+    textSize = sprintf_s(metadata, sizeof(metadata),
+        "format=VTOY_FRONT_EFI_BACKUP_V1\r\nencoding=UTF-8\r\n"
+        "backup_status=complete_before_first_disk_write\r\n"
+        "created_utc=%04u-%02u-%02uT%02u:%02u:%02uZ\r\noperation=%s\r\n"
+        "backup_file=%s\r\nbackup_bytes=%lu\r\nbackup_sha256=%s\r\n"
+        "historical_physical_drive=%d\r\ndisk_bytes=%llu\r\nlogical_sector_bytes=%lu\r\nphysical_sector_bytes=%lu\r\n"
+        "vendor=%s\r\nmodel=%s\r\nrevision=%s\r\nserial=%s\r\npartition_style=%s\r\n"
+        "mbr_signature=%08lx\r\ngpt_disk_guid=%s\r\ndata_start_lba=%llu\r\ndata_filesystem=%s\r\ndata_volume_guid=%s\r\n"
+        "range0_file_offset=0\r\nrange0_disk_offset=0\r\nrange0_bytes=%lu\r\n"
+        "range1_file_offset=%lu\r\nrange1_disk_offset=%llu\r\nrange1_bytes=%lu\r\n"
+        "recovery_note=The PhysicalDrive number can change after reconnecting. Match disk capacity, serial and disk identifiers; verify backup SHA256 before restoring the recorded byte ranges.\r\n"
+        "outcome_note=This record is written before the operation. It does not prove whether later disk writes or rollback completed. Keep the disk and backup unchanged if recovery is uncertain.\r\n",
+        timestamp.wYear, timestamp.wMonth, timestamp.wDay, timestamp.wHour, timestamp.wMinute, timestamp.wSecond,
+        Updating ? "update" : "install", backupName, frontBytes + tailBytes, sha256,
+        pPhyDrive->PhyDrive, pPhyDrive->SizeInBytes, pPhyDrive->BytesPerLogicalSector, pPhyDrive->BytesPerPhysicalSector,
+        pPhyDrive->VendorId, pPhyDrive->ProductId, pPhyDrive->ProductRev, pPhyDrive->SerialNumber, gpt ? "GPT" : "MBR",
+        signature, diskGuid, pPhyDrive->DataStartSector, pPhyDrive->FsName, pPhyDrive->ResizeVolumeGuid,
+        frontBytes, frontBytes, tailBytes ? tailOffset : 0, tailBytes);
+    if (textSize <= 0) goto out;
+    wideSize = MultiByteToWideChar(CP_ACP, 0, metadata, textSize, metadataWide, sizeof(metadataWide) / sizeof(metadataWide[0]));
+    if (!wideSize) goto out;
+    utf8Size = WideCharToMultiByte(CP_UTF8, 0, metadataWide, wideSize, utf8, sizeof(utf8), NULL, NULL);
+    if (!utf8Size || sprintf_s(metadataName, sizeof(metadataName), "%s.txt", backupName) <= 0) goto out;
+    metadataFile = CreateFileA(metadataName, GENERIC_READ | GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_FLAG_WRITE_THROUGH, NULL);
+    if (metadataFile == INVALID_HANDLE_VALUE)
+    {
+        VentoyFrontRecordIoError(&pPhyDrive->FrontIoError, FALSE, metadataName, "save backup metadata", "create", 0, 0, 0, GetLastError(), FALSE);
+        goto out;
+    }
+    if (!FrontWriteVerify(metadataFile, &pPhyDrive->FrontIoError, FALSE, metadataName, "save backup metadata", 0,
+            (BYTE *)utf8, utf8Size, check, NULL)) goto out;
+    CHECK_CLOSE_HANDLE(metadataFile);
     safe_strcpy(pPhyDrive->FrontBackupPath, backupName);
-    Log("Front EFI backup: %s (first %u bytes, then last %u bytes)", backupName, frontBytes, tailBytes);
+    Log("Front EFI backup: %s (first %u bytes, then last %u bytes); metadata: %s", backupName, frontBytes, tailBytes, metadataName);
 
     pPhyDrive->FrontEfiError = FRONT_ERR_LAYOUT;
     if (!Updating)
@@ -2287,29 +2469,30 @@ static int WriteFrontEfi(PHY_DRIVE_INFO *pPhyDrive, BOOL Updating)
     if (pPhyDrive->FrontEfiError) goto out;
     if (Updating)
         memcpy(stage1 + (2040 - (gpt ? 34 : 1)) * 512, saved + 2040 * 512, 4096);
+    if (!VentoyCheckFrontDataSignature(pPhyDrive, disk)) goto out;
     pPhyDrive->FrontEfiError = FRONT_ERR_DISK_IO;
-    changed = TRUE;
-    pPhyDrive->FrontEfiState = FRONT_STATE_CHANGED;
-    if (WritePart2Image(disk, 2048, check) || WriteGrubStage1Image(disk, gpt, stage1, check)) goto out;
+    for (i = 0; i < VENTOY_EFI_PART_SIZE / SIZE_1MB; i++)
+    {
+        BYTE *image = g_part_img_split ? g_part_img_buf[i] : g_part_img_buf[0] + i * SIZE_1MB;
+        UINT64 offset = SIZE_1MB + (UINT64)i * SIZE_1MB;
+        if (!FrontWriteDiskRange(pPhyDrive, disk, diskName, "EFI write/readback", offset, image, SIZE_1MB,
+                saved + (DWORD)offset, check, ranges, &rangeCount)) goto out;
+        PROGRESS_BAR_SET_POS(PT_WRITE_VENTOY_START + i);
+    }
+    size = gpt ? 34 * 512 : 512;
+    if (!FrontWriteDiskRange(pPhyDrive, disk, diskName, "BIOS core write/readback", size, stage1, SIZE_1MB - size,
+            saved + size, check, ranges, &rangeCount)) goto out;
     if (gpt && !Updating)
     {
         VentoyFillBackupGptHead(&table, &backupHead);
-        if (!WriteDataToPhyDisk(disk, tailOffset, table.PartTbl, sizeof(table.PartTbl)) ||
-            !WriteDataToPhyDisk(disk, tailOffset + 32 * 512, &backupHead, sizeof(backupHead))) goto out;
+        if (!FrontWriteDiskRange(pPhyDrive, disk, diskName, "GPT backup table", tailOffset,
+                (BYTE *)table.PartTbl, sizeof(table.PartTbl), saved + frontBytes, check, ranges, &rangeCount) ||
+            !FrontWriteDiskRange(pPhyDrive, disk, diskName, "GPT backup header", tailOffset + 32 * 512,
+                (BYTE *)&backupHead, sizeof(backupHead), saved + frontBytes + 32 * 512, check, ranges, &rangeCount)) goto out;
     }
     size = gpt && !Updating ? sizeof(table) : sizeof(table.MBR);
-    if (!WriteDataToPhyDisk(disk, 0, &table, size) || !FlushFileBuffers(disk)) goto out;
-    pos.QuadPart = 0;
-    if (!SetFilePointerEx(disk, pos, NULL, FILE_BEGIN) ||
-        !ReadFile(disk, check, size, &bytes, NULL) || bytes != size || memcmp(check, &table, size)) goto out;
-    if (gpt && !Updating)
-    {
-        pos.QuadPart = tailOffset;
-        if (!SetFilePointerEx(disk, pos, NULL, FILE_BEGIN) ||
-            !ReadFile(disk, check, tailBytes, &bytes, NULL) || bytes != tailBytes ||
-            memcmp(check, table.PartTbl, sizeof(table.PartTbl)) ||
-            memcmp(check + 32 * 512, &backupHead, sizeof(backupHead))) goto out;
-    }
+    if (!FrontWriteDiskRange(pPhyDrive, disk, diskName, "primary partition commit", 0, (BYTE *)&table, size,
+            saved, check, ranges, &rangeCount)) goto out;
     pPhyDrive->FrontEfi = TRUE;
     pPhyDrive->Part2GPTAttr = gpt ? table.PartTbl[0].Attr : 0;
     pPhyDrive->SecureBootSupport = FALSE;
@@ -2321,31 +2504,37 @@ static int WriteFrontEfi(PHY_DRIVE_INFO *pPhyDrive, BOOL Updating)
     pPhyDrive->FrontEfiState = FRONT_STATE_COMPLETE;
     rc = 0;
 out:
-    if (rc && changed)
+    if (rc && rangeCount)
     {
-        BOOL restored = WriteDataToPhyDisk(disk, 0, saved, frontBytes);
-        if (tailBytes && !WriteDataToPhyDisk(disk, pPhyDrive->SizeInBytes - tailBytes, saved + frontBytes, tailBytes))
-            restored = FALSE;
-        if (!FlushFileBuffers(disk)) restored = FALSE;
-        pos.QuadPart = 0;
-        if (!SetFilePointerEx(disk, pos, NULL, FILE_BEGIN)) restored = FALSE;
-        for (i = 0; restored && i < (int)(frontBytes / SIZE_1MB); i++)
-            if (!ReadFile(disk, check, SIZE_1MB, &bytes, NULL) || bytes != SIZE_1MB ||
-                memcmp(check, saved + i * SIZE_1MB, SIZE_1MB)) restored = FALSE;
-        if (restored && tailBytes)
+        BOOL restored = TRUE;
+        pPhyDrive->FrontEfiState = FRONT_STATE_CHANGED;
+        if (!pPhyDrive->FrontIoError.Valid)
+            VentoyFrontRecordIoError(&pPhyDrive->FrontIoError, TRUE, diskName, "disk write", "unknown", 0, 0, 0, ERROR_SUCCESS, FALSE);
+        if (pPhyDrive->FrontIoError.StopWrites)
+            Log("Front EFI stopped further disk writes; automatic restore skipped. Keep backup %s.", backupName);
+        else
         {
-            pos.QuadPart = tailOffset;
-            if (!SetFilePointerEx(disk, pos, NULL, FILE_BEGIN) ||
-                !ReadFile(disk, check, tailBytes, &bytes, NULL) || bytes != tailBytes ||
-                memcmp(check, saved + frontBytes, tailBytes)) restored = FALSE;
+            /* Restore only attempted ranges, with boot/partition metadata last. */
+            for (i = 0; i < rangeCount; i++)
+            {
+                if (!FrontWriteVerify(disk, &pPhyDrive->FrontRestoreIoError, TRUE, diskName, "restore attempted range",
+                        ranges[i].Offset, ranges[i].Original, ranges[i].Length, check, NULL))
+                {
+                    restored = FALSE;
+                    break;
+                }
+            }
+            pPhyDrive->FrontEfiState = restored ? FRONT_STATE_RESTORED : FRONT_STATE_RESTORE_FAILED;
+            Log("Front EFI failed; attempted-range restore %s. Keep backup %s.", restored ? "verified" : "FAILED", backupName);
         }
-        pPhyDrive->FrontEfiState = restored ? FRONT_STATE_RESTORED : FRONT_STATE_RESTORE_FAILED;
-        Log("Front EFI failed; restore %s. Keep backup %s.", restored ? "verified" : "FAILED", backupName);
     }
-    if (disk != INVALID_HANDLE_VALUE)
+    if (disk != INVALID_HANDLE_VALUE && (rc == 0 || pPhyDrive->FrontEfiState == FRONT_STATE_RESTORED))
         DeviceIoControl(disk, IOCTL_DISK_UPDATE_PROPERTIES, NULL, 0, NULL, 0, &ignored, NULL);
     CHECK_CLOSE_HANDLE(disk);
     CHECK_CLOSE_HANDLE(backup);
+    CHECK_CLOSE_HANDLE(metadataFile);
+    if (hash) CryptDestroyHash(hash);
+    if (provider) CryptReleaseContext(provider, 0);
     CHECK_CLOSE_HANDLE(backupDir);
     CHECK_CLOSE_HANDLE(volume);
     if (search != INVALID_HANDLE_VALUE) FindVolumeClose(search);

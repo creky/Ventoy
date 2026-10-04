@@ -1,7 +1,7 @@
 #!/bin/sh
 
 front_efi_package_check() {
-    if [ "$(vtoycli partresize --front-efi-api)" != VTOY_FRONT_EFI_SAFE_V2 ]; then
+    if [ "$(vtoycli partresize --front-efi-api)" != VTOY_FRONT_EFI_SAFE_V3 ]; then
         vterr 'The disk helper is outdated. Extract a complete rebuilt front EFI package; do not mix old tools with new scripts.'
         return 1
     fi
@@ -33,7 +33,7 @@ front_efi_write() (
             if [ "$phase" = prepare ]; then
                 vterr "Preparation failed; the target disk was NOT written."
                 [ -z "$workdir" ] || vterr "Preparation files: $workdir"
-                vterr "Resolve the reported error, then retry the same front EFI command. Do not use a formatting install."
+                vterr "Stop and check the named device or file. For target-disk I/O/disconnection errors, rescue its data first; for backup/package errors, use known-good storage. Do not repeatedly install or format."
             elif [ "$rc" != 1 ] && [ "$rc" != 3 ]; then
                 vterr "The transaction was interrupted; the disk may have been written. Stop and check before retrying."
                 vterr "Recovery directory: $workdir (backup.ready marks a completed backup). Keep this folder; do not format the disk."
@@ -58,15 +58,6 @@ front_efi_write() (
             exit 1
         }
     fi
-    if ! check_umount_disk "$DISK"; then
-        vterr 'A partition could not be unmounted. Close applications using it and unmount it before retrying.'
-        exit 1
-    fi
-    if grep -q "^${DISK}" /proc/mounts ||
-        awk -v disk="$DISK" 'NR > 1 && index($1, disk) == 1 { found=1 } END { exit !found }' /proc/swaps; then
-        vterr 'The target disk has mounted partitions or active swap. Unmount/swapoff it before retrying.'
-        exit 1
-    fi
     for holder in /sys/class/block/${DISK#/dev/}/holders/* /sys/class/block/${DISK#/dev/}/${DISK#/dev/}*/holders/*; do
         if [ -e "$holder" ]; then
             vterr 'The target disk belongs to an active device mapper or RAID device. Stop that device before retrying.'
@@ -80,7 +71,10 @@ front_efi_write() (
     vtinfo "Operation: $front_mode; EFI: partition 1, 1-33 MiB; data: partition 2, original location."
     vtinfo "Recovery directory: $workdir"
     vtwarn 'Use a working directory on another disk. Secure Boot must be disabled.'
-    read -p 'Confirm this disk and continue? (y/n) ' Answer
+    if ! read -r -p 'Confirm this disk and continue? (y/n) ' Answer; then
+        vtinfo "Cancelled; disk unchanged. Preparation files: $workdir"
+        exit 0
+    fi
     case "$Answer" in y|Y) ;; *) vtinfo "Cancelled; disk unchanged. Preparation files: $workdir"; exit 0 ;; esac
 
     cp ./boot/boot.img "$workdir/boot.img"
@@ -90,6 +84,7 @@ front_efi_write() (
     [ "$(wc -c < "$workdir/core.img")" -eq 1048064 ]
     [ "$(wc -c < "$workdir/efi.img")" -eq 33554432 ]
     vtoycli partresize -s "$workdir/efi.img" 0
+    check_umount_disk "$DISK"
     phase=transaction
     vtoycli partresize -W "$DISK" "$front_mode" "$workdir"
 )

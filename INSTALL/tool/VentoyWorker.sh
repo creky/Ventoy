@@ -26,7 +26,40 @@ print_usage() {
 SECUREBOOT="YES"
 VTNEW_LABEL='Ventoy'
 RESERVE_SIZE_MB=0
-while [ -n "$1" ]; do
+MODE=
+DISK=
+FORCE=
+NONDESTRUCTIVE=
+FRONT_EFI=
+RESERVE_SPACE=
+VTGPT=
+seen_options=
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -i|-I|-u|-l)
+            if [ -n "$MODE" ]; then
+                vterr 'Specify exactly one operation: -i, -I, -u or -l.'
+                exit 1
+            fi
+            ;;
+        -n|--front-efi|-s|-S|-g|-L|-r)
+            case " $seen_options " in
+                *" $1 "*) vterr "Duplicate option: $1"; exit 1 ;;
+            esac
+            seen_options="$seen_options $1"
+            ;;
+    esac
+    case "$1" in
+        -L|-r)
+            case "${2-}" in
+                ''|-*) vterr "$1 requires a value before the next option or device."; exit 1 ;;
+            esac
+            if [ -b "$2" ]; then
+                vterr "$1 requires a value; $2 is a device."
+                exit 1
+            fi
+            ;;
+    esac
     if [ "$1" = "-i" ]; then
         MODE="install"
     elif [ "$1" = "-I" ]; then
@@ -36,7 +69,6 @@ while [ -n "$1" ]; do
         NONDESTRUCTIVE="Y"
     elif [ "$1" = "--front-efi" ]; then
         FRONT_EFI="Y"
-        NONDESTRUCTIVE="Y"
     elif [ "$1" = "-u" ]; then
         MODE="update"
     elif [ "$1" = "-l" ]; then
@@ -60,6 +92,10 @@ while [ -n "$1" ]; do
         print_usage
         exit 0
     else
+        if [ -n "$DISK" ]; then
+            vterr 'Specify exactly one target disk.'
+            exit 1
+        fi
         if ! [ -b "$1" ]; then
             vterr "$1 is NOT a valid device"
             print_usage
@@ -82,8 +118,28 @@ if [ -z "$MODE" ]; then
     exit 1
 fi
 
-if [ -n "$FRONT_EFI" ] && { [ "$MODE" != install ] || [ -n "$RESERVE_SPACE" ] || [ -n "$VTGPT" ]; }; then
-    vterr '--front-efi requires -i/-I and cannot be combined with -r or -g.'
+case " $seen_options " in
+    *' -s '*)
+        case " $seen_options " in
+            *' -S '*) vterr '-s and -S cannot be combined.'; exit 1 ;;
+        esac
+        ;;
+esac
+
+if [ "$MODE" != install ] && [ -n "$NONDESTRUCTIVE$FRONT_EFI$RESERVE_SPACE$VTGPT" ]; then
+    vterr '-n, --front-efi, -r and -g are only valid with -i/-I.'
+    exit 1
+fi
+case " $seen_options " in
+    *' -L '*)
+        if [ "$MODE" != install ] || [ -n "$NONDESTRUCTIVE$FRONT_EFI" ]; then
+            vterr '-L is only valid for a formatting installation.'
+            exit 1
+        fi
+        ;;
+esac
+if [ -n "$FRONT_EFI" ] && [ -n "$NONDESTRUCTIVE$RESERVE_SPACE$VTGPT" ]; then
+    vterr '--front-efi cannot be combined with -n, -r or -g.'
     exit 1
 fi
 
@@ -144,21 +200,28 @@ if [ "$MODE" = "list" ]; then
     exit 0
 fi
 
-#check mountpoint
-check_umount_disk "$DISK"
-
-if grep "$DISK" /proc/mounts; then
-    vterr "$DISK is already mounted, please umount it first!"
-    exit 1
-fi
-
-#check swap partition
-if swapon --help 2>&1 | grep -q '^ -s,'; then
-    if swapon -s | grep -q "^${DISK}[0-9]"; then
-        vterr "$DISK is used as swap, please swapoff it first!"
+# Front operations do not unmount anything until the user confirms the disk.
+if [ "$MODE" = install ] && [ -n "$FRONT_EFI" ]; then
+    if get_disk_ventoy_version "$DISK" >/dev/null; then
+        vterr 'The disk already contains Ventoy. Use -u to update it.'
         exit 1
     fi
+    front_efi_write install
+    exit $?
+elif [ "$MODE" = update ]; then
+    update_efi_part=$(get_disk_efi_part_number "$DISK") || {
+        vterr 'The existing partition layout could not be verified. Reconnect the disk and inspect it before retrying.'
+        vterr 'If a prior operation failed, keep its recovery folder. Do not use a normal install to repair the disk.'
+        exit 1
+    }
+    if [ "$update_efi_part" = 1 ]; then
+        front_efi_write update
+        exit $?
+    fi
 fi
+
+#check mountpoint and swap
+check_umount_disk "$DISK" || exit 1
 
 #check access
 if dd if="$DISK" of=/dev/null bs=1 count=1 >/dev/null 2>&1; then
@@ -185,14 +248,7 @@ if [ -d ./tmp_mnt ]; then
 fi
 
 
-if [ "$MODE" = install ] && [ -n "$FRONT_EFI" ]; then
-    if get_disk_ventoy_version "$DISK" >/dev/null; then
-        vterr 'The disk already contains Ventoy. Use -u to update it.'
-        exit 1
-    fi
-    front_efi_write install
-    exit $?
-elif [ "$MODE" = "install" -a -z "$NONDESTRUCTIVE" ]; then
+if [ "$MODE" = "install" -a -z "$NONDESTRUCTIVE" ]; then
     vtdebug "install Ventoy ..."
 
     if [ -n "$VTGPT" ]; then
@@ -299,7 +355,7 @@ elif [ "$MODE" = "install" -a -z "$NONDESTRUCTIVE" ]; then
     fi
 
     # check and umount
-    check_umount_disk "$DISK"
+    check_umount_disk "$DISK" || exit 1
 
     if ! dd if=/dev/zero of=$DISK bs=64 count=512 status=none conv=fsync; then
         vterr "Write data to $DISK failed, please check whether it's in use."
@@ -308,10 +364,10 @@ elif [ "$MODE" = "install" -a -z "$NONDESTRUCTIVE" ]; then
 
     if [ -n "$VTGPT" ]; then
         vtdebug "format_ventoy_disk_gpt $RESERVE_SIZE_MB $DISK $PARTTOOL ..."
-        format_ventoy_disk_gpt $RESERVE_SIZE_MB $DISK $PARTTOOL
+        format_ventoy_disk_gpt $RESERVE_SIZE_MB $DISK $PARTTOOL || exit 1
     else
         vtdebug "format_ventoy_disk_mbr $RESERVE_SIZE_MB $DISK $PARTTOOL ..."
-        format_ventoy_disk_mbr $RESERVE_SIZE_MB $DISK $PARTTOOL
+        format_ventoy_disk_mbr $RESERVE_SIZE_MB $DISK $PARTTOOL || exit 1
     fi
 
     # format part1
@@ -361,7 +417,7 @@ elif [ "$MODE" = "install" -a -z "$NONDESTRUCTIVE" ]; then
     fi
     
     # check and umount
-    check_umount_disk "$DISK"
+    check_umount_disk "$DISK" || exit 1
 
     xzcat ./ventoy/ventoy.disk.img.xz | dd status=none conv=fsync of=$DISK bs=512 count=$VENTOY_SECTOR_NUM seek=$part2_start_sector
 
@@ -382,7 +438,7 @@ elif [ "$MODE" = "install" -a -z "$NONDESTRUCTIVE" ]; then
 
     if [ "$SECUREBOOT" != "YES" ]; then 
         sleep 2
-        check_umount_disk "$DISK"  
+        check_umount_disk "$DISK" || exit 1
         vtoycli partresize -s $DISK $part2_start_sector
     fi
 
@@ -460,9 +516,9 @@ elif [ "$MODE" = "install" -a -n "$NONDESTRUCTIVE" ]; then
         exit 1
     else
         # check and umount
-        check_umount_disk "$DISK"
+        check_umount_disk "$DISK" || exit 1
         sleep 1
-        check_umount_disk "$DISK"
+        check_umount_disk "$DISK" || exit 1
     
         if [ $vtRet -eq 1 ]; then
             echo "Free space enough, start install..."
@@ -565,16 +621,6 @@ elif [ "$MODE" = "install" -a -n "$NONDESTRUCTIVE" ]; then
 else
     vtdebug "update Ventoy ..."
 
-    update_efi_part=$(get_disk_efi_part_number "$DISK") || {
-        vterr 'The existing partition layout could not be verified. Reconnect the disk and inspect it before retrying.'
-        vterr 'If a prior operation failed, keep its recovery folder. Do not use a normal install to repair the disk.'
-        exit 1
-    }
-    if [ "$update_efi_part" = 1 ]; then
-        front_efi_write update
-        exit $?
-    fi
-    
     oldver=$(get_disk_ventoy_version $DISK)
     if [ $? -ne 0 ]; then
         if is_disk_contains_ventoy $DISK; then
@@ -651,7 +697,7 @@ else
     dd status=none conv=fsync if=./rsvdata.bin seek=2040 bs=512 count=8 of=${DISK}
     rm -f ./rsvdata.bin
 
-    check_umount_disk "$DISK"
+    check_umount_disk "$DISK" || exit 1
     
     xzcat ./ventoy/ventoy.disk.img.xz | dd status=none conv=fsync of=$DISK bs=512 count=$VENTOY_SECTOR_NUM seek=$part2_start
     sync
@@ -659,7 +705,7 @@ else
     vtinfo "esp partition processing ..."
     if [ "$SECUREBOOT" != "YES" ]; then
         sleep 2
-        check_umount_disk "$DISK"
+        check_umount_disk "$DISK" || exit 1
         vtoycli partresize -s $DISK $part2_start
     fi
 

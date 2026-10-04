@@ -172,7 +172,8 @@ typedef enum VTOY_FRONT_ERROR
     FRONT_ERR_VOLUME_BUSY, FRONT_ERR_DISK_CHANGED, FRONT_ERR_BACKUP_IO,
     FRONT_ERR_MEMORY, FRONT_ERR_IMAGE, FRONT_ERR_DISK_IO, FRONT_ERR_WORKER,
     FRONT_ERR_ALREADY_INSTALLED, FRONT_ERR_NO_VOLUME, FRONT_ERR_SYSTEM_DISK,
-    FRONT_ERR_PARTITION_SLOTS, FRONT_ERR_UNSUPPORTED_DISK
+    FRONT_ERR_PARTITION_SLOTS, FRONT_ERR_UNSUPPORTED_DISK,
+    FRONT_ERR_FILESYSTEM, FRONT_ERR_ENCRYPTED, FRONT_ERR_BACKUP_METADATA
 } VTOY_FRONT_ERROR;
 
 typedef enum VTOY_FRONT_STATE
@@ -180,6 +181,21 @@ typedef enum VTOY_FRONT_STATE
     FRONT_STATE_UNTOUCHED, FRONT_STATE_CHANGED, FRONT_STATE_RESTORED,
     FRONT_STATE_RESTORE_FAILED, FRONT_STATE_COMPLETE
 } VTOY_FRONT_STATE;
+
+typedef struct VTOY_FRONT_IO_ERROR
+{
+    BOOL Valid;
+    BOOL IsDisk;
+    BOOL StopWrites;
+    BOOL Mismatch;
+    DWORD SystemError;
+    DWORD Requested;
+    DWORD Transferred;
+    UINT64 Offset;
+    CHAR Phase[64];
+    CHAR Operation[16];
+    CHAR Target[MAX_PATH + 4];
+} VTOY_FRONT_IO_ERROR;
 
 typedef struct PHY_DRIVE_INFO
 {
@@ -212,6 +228,8 @@ typedef struct PHY_DRIVE_INFO
     int FrontEfiError;
     int FrontEfiState;
     CHAR FrontBackupPath[MAX_PATH];
+    VTOY_FRONT_IO_ERROR FrontIoError;
+    VTOY_FRONT_IO_ERROR FrontRestoreIoError;
 
 	BOOL ResizeNoShrink;
     BOOL ResizeFrontEfi;
@@ -327,7 +345,16 @@ BOOL VentoyValidateFrontLayout(const VTOY_GPT_INFO *Gpt, UINT64 DiskBytes, BOOL 
 BOOL VentoyCheckFrontLayout(const VTOY_GPT_INFO *Gpt, UINT64 DiskBytes, BOOL Installed, int *Reason);
 BOOL VentoyCheckFrontEfiPackage(void);
 BOOL VentoyPrepareFrontUpdate(PHY_DRIVE_INFO *pPhyDrive);
+BOOL VentoyCheckFrontDataVolume(PHY_DRIVE_INFO *pPhyDrive, HANDLE Disk);
+BOOL VentoyCheckFrontDataSignature(PHY_DRIVE_INFO *pPhyDrive, HANDLE Disk);
+void VentoyFrontRecordIoError(VTOY_FRONT_IO_ERROR *Error, BOOL IsDisk, const CHAR *Target,
+    const CHAR *Phase, const CHAR *Operation, UINT64 Offset, DWORD Requested,
+    DWORD Transferred, DWORD SystemError, BOOL Mismatch);
+BOOL VentoyFrontRead(HANDLE Handle, VTOY_FRONT_IO_ERROR *Error, BOOL IsDisk,
+    const CHAR *Target, const CHAR *Phase, UINT64 Offset, VOID *Buffer, DWORD Length);
 void VentoyShowFrontEfiResult(PHY_DRIVE_INFO *pPhyDrive, BOOL Success);
+BOOL CLI_InitStatus(void);
+void CLI_FinishStatus(int ret);
 
 #define SET_FILE_POS(pos) \
     liCurrentPosition.QuadPart = pos; \
