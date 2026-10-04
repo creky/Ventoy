@@ -723,7 +723,7 @@ static uint64_t vtoydm_get_part_secnum(const char *diskname, int part)
     return size;
 }
 
-static int vtoydm_vlnk_convert(char *disk, int len, int *part, uint64_t *offset)
+static int vtoydm_resolve_partition(char *disk, int len, int *part, uint64_t *offset)
 {
     int rc = 1;
     int cnt = 0;
@@ -755,15 +755,24 @@ static int vtoydm_vlnk_convert(char *disk, int len, int *part, uint64_t *offset)
         debug("vtoy_find_disk_by_guid cnt=%d\n", cnt);
         if (cnt == 1)
         {
-            *part = param.vtoy_disk_part_id;
-            *offset = vtoydm_get_part_start(diskname, *part);
-
-            debug("VLNK <%s> <%s> <P%d> <%llu>\n", disk, diskname, *part, (unsigned long long)(*offset));
-
             snprintf(disk, len, "/dev/%s", diskname);
-
-            rc = 0;
         }
+        else
+        {
+            goto end;
+        }
+    }
+    else
+    {
+        snprintf(diskname, sizeof(diskname), "%s", strncmp(disk, "/dev/", 5) == 0 ? disk + 5 : disk);
+    }
+
+    *part = param.vtoy_disk_part_id;
+    *offset = vtoydm_get_part_start(diskname, *part);
+    if (*part > 0 && *offset > 0)
+    {
+        debug("VTOY_FRONT_EFI_V1 image partition <%s> <P%d> <%llu>\n", diskname, *part, (unsigned long long)(*offset));
+        rc = 0;
     }
 
 end:
@@ -979,8 +988,8 @@ int vtoydm_main(int argc, char **argv)
 {
     int ch;
     int cmd = 0;
-    int part = 1;
-    uint64_t offset = 2048;
+    int part = 0;
+    uint64_t offset = 0;
     unsigned long first_sector = 0;
     unsigned long long file_size = 0;
     char diskname[128] = {0};
@@ -1065,7 +1074,12 @@ int vtoydm_main(int argc, char **argv)
     debug("cmd=%d file=<%s> disk=<%s> first_sector=%lu file_size=%llu\n",
           cmd, filepath, diskname, first_sector, file_size);
 
-    vtoydm_vlnk_convert(diskname, sizeof(diskname), &part, &offset);
+    if (vtoydm_resolve_partition(diskname, sizeof(diskname), &part, &offset) != 0 &&
+        (cmd == CMD_PRINT_TABLE || cmd == CMD_PRINT_RAW_TABLE || cmd == CMD_PRINT_WRAP_TABLE))
+    {
+        fprintf(stderr, "Failed to resolve image partition\n");
+        return 1;
+    }
 
     switch (cmd)
     {

@@ -118,8 +118,26 @@ get_ventoy_version_from_cfg() {
     fi
 }
 
+get_disk_efi_part_number() {
+    # Only the front layout needs the stricter new validator; keep legacy compatibility.
+    first_part=$(get_disk_part_name "$1" 1)
+    if [ "$(cat /sys/class/block/${first_part#/dev/}/size 2>/dev/null)" = "$VENTOY_SECTOR_NUM" ] &&
+       [ "$(cat /sys/class/block/${first_part#/dev/}/start 2>/dev/null)" = 2048 ]; then
+        layout_efi=$(vtoycli partresize -L "$1") || { echo 0; return 1; }
+        echo "$layout_efi"
+    else
+        echo 2
+    fi
+}
+
 is_disk_contains_ventoy() {
     DISK=$1    
+
+    efi_number=$(get_disk_efi_part_number "$DISK") || return 1
+    if [ "$efi_number" = 1 ]; then
+        ventoy_true
+        return
+    fi
     
     PART1=$(get_disk_part_name $1 1)  
     PART2=$(get_disk_part_name $1 2)  
@@ -185,7 +203,7 @@ check_disk_secure_boot() {
         return
     fi
     
-    PART2=$(get_disk_part_name $1 2)    
+    PART2=$(get_disk_part_name "$1" "$(get_disk_efi_part_number "$1")")
     
     vtoycli fat -s $PART2
 }
@@ -197,7 +215,7 @@ get_disk_ventoy_version() {
         return
     fi
     
-    PART2=$(get_disk_part_name $1 2)    
+    PART2=$(get_disk_part_name "$1" "$(get_disk_efi_part_number "$1")")
     
     ParseVer=$(vtoycli fat $PART2)
     if [ $? -eq 0 ]; then

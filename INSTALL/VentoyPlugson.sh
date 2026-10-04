@@ -160,7 +160,8 @@ else
     exit 1
 fi
 
-PART1=$(get_disk_part_name $DISK 1)
+efi_number=$(get_disk_efi_part_number "$DISK")
+PART1=$(get_disk_part_name "$DISK" "$((3 - efi_number))")
 
 if grep -q "^$PART1 " /proc/mounts; then
     mtpnt=$(grep "^$PART1 " /proc/mounts | awk '{print $2}' | sed 's/\\040/ /g')

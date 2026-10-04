@@ -2,6 +2,40 @@
 
 VTOY_PATH=$PWD/..
 
+# FRONT_EFI also rebuilds the normally prebuilt Linux helpers. The historical
+# fallback toolchains and Windows PE helpers must be rebuilt on their own hosts.
+if [ "$1" = "FRONT_EFI" ]; then
+    for front_file in "$VTOY_PATH/INSTALL/ventoy/vtoyjump32.exe" \
+        "$VTOY_PATH/INSTALL/ventoy/vtoyjump64.exe" \
+        "$VTOY_PATH/VtoyTool/vtoytool/01/vtoytool_64" \
+        "$VTOY_PATH/VtoyTool/vtoytool/02/vtoytool_64"; do
+        if [ ! -f "$front_file" ] || ! grep -aFq VTOY_FRONT_EFI_V1 "$front_file"; then
+            echo "FRONT_EFI requires a rebuilt $front_file"
+            echo "Rebuild the Windows installers/PE helpers and VtoyTool 01/02 with their compatible toolchains first."
+            exit 1
+        fi
+    done
+    if [ ! -f "$VTOY_PATH/INSTALL/Ventoy2Disk.exe" ] || \
+        ! grep -aFq VTOY_FRONT_EFI_SAFE_V2 "$VTOY_PATH/INSTALL/Ventoy2Disk.exe"; then
+        echo "FRONT_EFI requires a rebuilt Windows installer with VTOY_FRONT_EFI_SAFE_V2."
+        exit 1
+    fi
+    for front_file in "$VTOY_PATH/INSTALL"/Ventoy2Disk_*.exe; do
+        [ -e "$front_file" ] || continue
+        if ! grep -aFq VTOY_FRONT_EFI_SAFE_V2 "$front_file"; then
+            echo "FRONT_EFI requires a rebuilt $front_file with VTOY_FRONT_EFI_SAFE_V2."
+            exit 1
+        fi
+    done
+    for front_file in "$VTOY_PATH/Plugson/vs/VentoyPlugson/Release/VentoyPlugson.exe" \
+        "$VTOY_PATH/Plugson/vs/VentoyPlugson/x64/Release/VentoyPlugson_X64.exe"; do
+        if [ ! -f "$front_file" ] || ! grep -aFq 'Selected volume does not match the Ventoy data partition' "$front_file"; then
+            echo "FRONT_EFI requires the rebuilt Windows Plugson: $front_file"
+            exit 1
+        fi
+    done
+fi
+
 cilog() {
     datestr=$(date +"%Y/%m/%d %H:%M:%S")
     echo "$datestr $*"
@@ -27,6 +61,30 @@ sh buildipxe.sh >> $LOG 2>&1 || exit 1
 cilog "build edk2 ..."
 cd $VTOY_PATH/EDK2
 sh buildedk.sh >> $LOG 2>&1 || exit 1
+
+if [ "$1" = "FRONT_EFI" ]; then
+    cilog "build front EFI VtoyTool ..."
+    cd "$VTOY_PATH/VtoyTool" || exit 1
+    bash -e build.sh >> "$LOG" 2>&1 || exit 1
+
+    cilog "build front EFI vtoycli ..."
+    cd "$VTOY_PATH/vtoycli/fat_io_lib" || exit 1
+    bash -e buildlib.sh >> "$LOG" 2>&1 || exit 1
+    cd "$VTOY_PATH/vtoycli" || exit 1
+    bash -e build.sh >> "$LOG" 2>&1 || exit 1
+    for front_arch in i386 x86_64 aarch64 mips64el; do
+        front_file="$VTOY_PATH/INSTALL/tool/$front_arch/vtoycli"
+        if [ ! -f "$front_file" ] || ! grep -aFq VTOY_FRONT_EFI_SAFE_V2 "$front_file"; then
+            echo "FRONT_EFI requires a rebuilt $front_file with VTOY_FRONT_EFI_SAFE_V2."
+            exit 1
+        fi
+    done
+
+    cilog "build front EFI GTK and Qt interfaces ..."
+    cd "$VTOY_PATH/LinuxGUI" || exit 1
+    bash -e build_gtk.sh >> "$LOG" 2>&1 || exit 1
+    bash -e build_qt.sh >> "$LOG" 2>&1 || exit 1
+fi
 
 
 

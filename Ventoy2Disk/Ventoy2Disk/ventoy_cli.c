@@ -3,6 +3,7 @@
 #include <tlhelp32.h>
 #include <Psapi.h>
 #include <commctrl.h>
+#include <limits.h>
 #include "resource.h"
 #include "Language.h"
 #include "Ventoy2Disk.h"
@@ -18,6 +19,7 @@ typedef struct CLI_CFG
     int ReserveMB;
     BOOL USBCheck;
     BOOL NonDest;
+    BOOL FrontEfi;
     int fstype;
 }CLI_CFG;
 
@@ -29,6 +31,7 @@ static PHY_DRIVE_INFO* g_CLI_PhyDrvInfo = NULL;
 
 static int CLI_GetPhyDriveInfo(int PhyDrive, PHY_DRIVE_INFO* pInfo)
 {
+    int rc = 1;
     BOOL bRet;
     DWORD dwBytes;
     HANDLE Handle = INVALID_HANDLE_VALUE;
@@ -36,7 +39,7 @@ static int CLI_GetPhyDriveInfo(int PhyDrive, PHY_DRIVE_INFO* pInfo)
     GET_LENGTH_INFORMATION LengthInfo;
     STORAGE_PROPERTY_QUERY Query;
     STORAGE_DESCRIPTOR_HEADER DevDescHeader;
-    STORAGE_DEVICE_DESCRIPTOR* pDevDesc;
+    STORAGE_DEVICE_DESCRIPTOR* pDevDesc = NULL;
     STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR diskAlignment;
 
     safe_sprintf(PhyDrivePath, "\\\\.\\PhysicalDrive%d", PhyDrive);
@@ -45,7 +48,7 @@ static int CLI_GetPhyDriveInfo(int PhyDrive, PHY_DRIVE_INFO* pInfo)
 
     if (Handle == INVALID_HANDLE_VALUE)
     {
-        return 1;
+        goto out;
     }
 
     bRet = DeviceIoControl(Handle,
@@ -58,7 +61,7 @@ static int CLI_GetPhyDriveInfo(int PhyDrive, PHY_DRIVE_INFO* pInfo)
     if (!bRet)
     {
         Log("DeviceIoControl IOCTL_DISK_GET_LENGTH_INFO failed error:%u", LASTERR);
-        return 1;
+        goto out;
     }
 
     Log("PHYSICALDRIVE%d size %llu bytes", PhyDrive, (ULONGLONG)LengthInfo.Length.QuadPart);
@@ -77,20 +80,20 @@ static int CLI_GetPhyDriveInfo(int PhyDrive, PHY_DRIVE_INFO* pInfo)
     if (!bRet)
     {
         Log("DeviceIoControl1 error:%u dwBytes:%u", LASTERR, dwBytes);
-        return 1;
+        goto out;
     }
 
     if (DevDescHeader.Size < sizeof(STORAGE_DEVICE_DESCRIPTOR))
     {
         Log("Invalid DevDescHeader.Size:%u", DevDescHeader.Size);
-        return 1;
+        goto out;
     }
 
     pDevDesc = (STORAGE_DEVICE_DESCRIPTOR*)malloc(DevDescHeader.Size);
     if (!pDevDesc)
     {
         Log("failed to malloc error:%u len:%u", LASTERR, DevDescHeader.Size);
-        return 1;
+        goto out;
     }
 
     bRet = DeviceIoControl(Handle,
@@ -104,8 +107,7 @@ static int CLI_GetPhyDriveInfo(int PhyDrive, PHY_DRIVE_INFO* pInfo)
     if (!bRet)
     {
         Log("DeviceIoControl2 error:%u dwBytes:%u", LASTERR, dwBytes);
-        free(pDevDesc);
-        return 1;
+        goto out;
     }
 
 
@@ -125,6 +127,7 @@ static int CLI_GetPhyDriveInfo(int PhyDrive, PHY_DRIVE_INFO* pInfo)
     if (!bRet)
     {
         Log("DeviceIoControl3 error:%u dwBytes:%u", LASTERR, dwBytes);
+        goto out;
     }
 
 
@@ -161,11 +164,34 @@ static int CLI_GetPhyDriveInfo(int PhyDrive, PHY_DRIVE_INFO* pInfo)
         TrimString(pInfo->SerialNumber);
     }
 
-    free(pDevDesc);
-
+    rc = 0;
+out:
+    CHECK_FREE(pDevDesc);
     CHECK_CLOSE_HANDLE(Handle);
 
-    return 0;
+    return rc;
+}
+
+static BOOL CLI_ParseNumber(const char* str, int* value)
+{
+    int number = 0;
+
+    if (!str || !*str)
+    {
+        return FALSE;
+    }
+
+    for (; *str; str++)
+    {
+        if (*str < '0' || *str > '9' || number > (INT_MAX - (*str - '0')) / 10)
+        {
+            return FALSE;
+        }
+        number = number * 10 + (*str - '0');
+    }
+
+    *value = number;
+    return TRUE;
 }
 
 static int CLI_CheckParam(int argc, char** argv, PHY_DRIVE_INFO* pDrvInfo, CLI_CFG *pCfg)
@@ -179,53 +205,103 @@ static int CLI_CheckParam(int argc, char** argv, PHY_DRIVE_INFO* pDrvInfo, CLI_C
     int ReserveMB = 0;
     BOOL USBCheck = TRUE;
     BOOL NonDest = FALSE;
+    BOOL FrontEfi = FALSE;
+    BOOL SecureBoot = g_SecureBoot;
+    char LogicalDrive = 0;
+    UINT SeenOptions = 0;
+    UINT OptionFlag;
+    enum
+    {
+        OPT_OP = 1, OPT_TARGET = 2, OPT_GPT = 4, OPT_NOSB = 8,
+        OPT_NOUSB = 16, OPT_FRONT = 32, OPT_NONDEST = 64,
+        OPT_RESERVE = 128, OPT_FS = 256
+    };
     MBR_HEAD MBR;
     UINT64 Part2GPTAttr = 0;
     UINT64 Part2StartSector = 0;
 
-    for (i = 0; i < argc; i++)
+    if (argc < 4 || !argv || !argv[1] || _stricmp(argv[1], "VTOYCLI") != 0)
+    {
+        goto invalid_parameter;
+    }
+
+    for (i = 2; i < argc; i++)
     {
         opt = argv[i];
+        if (!opt || !*opt)
+        {
+            goto invalid_parameter;
+        }
         if (_stricmp(opt, "/I") == 0)
         {
+            OptionFlag = OPT_OP;
             op = 0;
         }
         else if (_stricmp(opt, "/U") == 0)
         {
+            OptionFlag = OPT_OP;
             op = 1;
         }
         else if (_stricmp(opt, "/GPT") == 0)
         {
+            OptionFlag = OPT_GPT;
             PartStyle = 1;
         }
         else if (_stricmp(opt, "/NoSB") == 0)
         {
-            g_SecureBoot = FALSE;
+            OptionFlag = OPT_NOSB;
+            SecureBoot = FALSE;
         }
         else if (_stricmp(opt, "/NoUSBCheck") == 0)
         {
+            OptionFlag = OPT_NOUSB;
             USBCheck = FALSE;
+        }
+        else if (_stricmp(opt, "/FrontEfi") == 0)
+        {
+            OptionFlag = OPT_FRONT;
+            FrontEfi = TRUE;
+            NonDest = TRUE;
         }
         else if (_stricmp(opt, "/NonDest") == 0)
         {
+            OptionFlag = OPT_NONDEST;
             NonDest = TRUE;
         }
         else if (_strnicmp(opt, "/Drive:", 7) == 0)
         {
-            Log("Get PhyDrive by logical drive %C:", opt[7]);
-            PhyDrive = GetPhyDriveByLogicalDrive(opt[7], NULL);            
+            OptionFlag = OPT_TARGET;
+            if (!((opt[7] >= 'A' && opt[7] <= 'Z') || (opt[7] >= 'a' && opt[7] <= 'z')) ||
+                (opt[8] != 0 && (opt[8] != ':' || opt[9] != 0)))
+            {
+                goto invalid_parameter;
+            }
+            LogicalDrive = opt[7];
         }
         else if (_strnicmp(opt, "/PhyDrive:", 10) == 0)
         {
-            PhyDrive = (int)strtol(opt + 10, NULL, 10);
+            OptionFlag = OPT_TARGET;
+            if (!CLI_ParseNumber(opt + 10, &PhyDrive))
+            {
+                goto invalid_parameter;
+            }
         }
         else if (_strnicmp(opt, "/R:", 3) == 0)
         {
-            ReserveMB = (int)strtol(opt + 3, NULL, 10);
+            OptionFlag = OPT_RESERVE;
+            if (!CLI_ParseNumber(opt + 3, &ReserveMB))
+            {
+                goto invalid_parameter;
+            }
         }
         else if (_strnicmp(opt, "/FS:", 4) == 0)
         {
-            if (_stricmp(opt + 4, "NTFS") == 0)
+            OptionFlag = OPT_FS;
+            if (_stricmp(opt + 4, "EXFAT") == 0)
+            {
+                fstype = VTOY_FS_EXFAT;
+            }
+            else if (_stricmp(opt + 4, "NTFS") == 0)
             {
                 fstype = VTOY_FS_NTFS;
             }
@@ -237,20 +313,42 @@ static int CLI_CheckParam(int argc, char** argv, PHY_DRIVE_INFO* pDrvInfo, CLI_C
             {
                 fstype = VTOY_FS_UDF;
             }
+            else
+            {
+                goto invalid_parameter;
+            }
+        }
+        else
+        {
+            goto invalid_parameter;
+        }
+
+        if (SeenOptions & OptionFlag)
+        {
+            Log("[ERROR] Duplicate or conflicting CLI option: %s", opt);
+            goto invalid_parameter;
+        }
+        SeenOptions |= OptionFlag;
+    }
+
+    if (op < 0 || !(SeenOptions & OPT_TARGET) ||
+        (op != 0 && (NonDest || (SeenOptions & (OPT_GPT | OPT_RESERVE | OPT_FS)))) ||
+        (NonDest && (SeenOptions & (OPT_GPT | OPT_RESERVE | OPT_FS))))
+    {
+        Log("[ERROR] Invalid CLI mode combination: /FrontEfi and /NonDest require /I and preserve partition style, size and filesystem.");
+        goto invalid_parameter;
+    }
+
+    if (LogicalDrive)
+    {
+        Log("Get PhyDrive by logical drive %C:", LogicalDrive);
+        PhyDrive = GetPhyDriveByLogicalDrive(LogicalDrive, NULL);
+        if (PhyDrive < 0)
+        {
+            Log("[ERROR] Failed to resolve logical drive %C:", LogicalDrive);
+            return 1;
         }
     }
-
-    if (op < 0 || PhyDrive < 0)
-    {
-        Log("[ERROR] Invalid parameters %d %d", op, PhyDrive);
-        return 1;
-    }
-
-    Log("Ventoy CLI %s PhyDrive:%d %s SecureBoot:%d ReserveSpace:%dMB USBCheck:%u FS:%s NonDest:%d",
-        op == 0 ? "install" : "update",
-        PhyDrive, PartStyle ? "GPT" : "MBR",
-        g_SecureBoot, ReserveMB, USBCheck, GetVentoyFsFmtNameByTypeA(fstype), NonDest
-        );
 
     if (CLI_GetPhyDriveInfo(PhyDrive, pDrvInfo))
     {
@@ -263,11 +361,12 @@ static int CLI_CheckParam(int argc, char** argv, PHY_DRIVE_INFO* pDrvInfo, CLI_C
         GetHumanReadableGBSize(pDrvInfo->SizeInBytes), pDrvInfo->SizeInBytes,
         pDrvInfo->VendorId, pDrvInfo->ProductId);
 
-    if (IsVentoyPhyDrive(PhyDrive, pDrvInfo->SizeInBytes, &MBR, &Part2StartSector, &Part2GPTAttr))
+    if (IsVentoyPhyDrive(PhyDrive, pDrvInfo->SizeInBytes, &MBR, &Part2StartSector, &Part2GPTAttr, &pDrvInfo->DataStartSector))
     {
         memcpy(&(pDrvInfo->MBR), &MBR, sizeof(MBR));
         pDrvInfo->PartStyle = (MBR.PartTbl[0].FsFlag == 0xEE) ? 1 : 0;
         pDrvInfo->Part2GPTAttr = Part2GPTAttr;
+        pDrvInfo->FrontEfi = (Part2StartSector == 2048);
         GetVentoyVerInPhyDrive(pDrvInfo, Part2StartSector, pDrvInfo->VentoyVersion, sizeof(pDrvInfo->VentoyVersion), &(pDrvInfo->SecureBootSupport));
         Log("PhyDrive %d is Ventoy Disk ver:%s SecureBoot:%u", pDrvInfo->PhyDrive, pDrvInfo->VentoyVersion, pDrvInfo->SecureBootSupport);
 
@@ -285,20 +384,42 @@ static int CLI_CheckParam(int argc, char** argv, PHY_DRIVE_INFO* pDrvInfo, CLI_C
         GetLettersBelongPhyDrive(PhyDrive, pDrvInfo->DriveLetters, sizeof(pDrvInfo->DriveLetters));
     }
 
+    g_SecureBoot = (FrontEfi || (op == 1 && pDrvInfo->FrontEfi)) ? FALSE : SecureBoot;
+    Log("Ventoy CLI mode:%s PhyDrive:%d Size:%llu bytes PartStyle:%s SecureBoot:%d ReserveSpace:%dMB USBCheck:%u FS:%s",
+        op == 1 ? (pDrvInfo->FrontEfi ? "front-efi-update" : "update") :
+        (FrontEfi ? "front-efi-install" : (NonDest ? "non-destructive-install" : "format-install")),
+        PhyDrive, pDrvInfo->SizeInBytes,
+        NonDest ? "preserve" : ((op == 1 ? pDrvInfo->PartStyle : PartStyle) ? "GPT" : "MBR"),
+        g_SecureBoot, ReserveMB, USBCheck,
+        (NonDest || op == 1) ? "preserve" : GetVentoyFsFmtNameByTypeA(fstype));
+    if (FrontEfi || (op == 1 && pDrvInfo->FrontEfi))
+    {
+        Log("Front EFI preserves the existing data partition; SecureBoot is disabled. The partition table and package are checked before writing.");
+    }
+
     pCfg->op = op;
     pCfg->PartStyle = PartStyle;
     pCfg->ReserveMB = ReserveMB;
     pCfg->USBCheck = USBCheck;
     pCfg->NonDest = NonDest;
+    pCfg->FrontEfi = FrontEfi;
     pCfg->fstype = fstype;
 
     return 0;
+
+invalid_parameter:
+    Log("[ERROR] Invalid CLI parameters%s%s", opt ? ": " : "", opt ? opt : "");
+    Log("Usage: Ventoy2Disk.exe VTOYCLI { /I | /U } { /Drive:F: | /PhyDrive:1 } [options]");
+    Log("/I formats the disk by default. Options: /GPT /R:MB /FS:EXFAT|NTFS|FAT32|UDF /NoSB /NoUSBCheck.");
+    Log("/I /NonDest preserves existing data. /I /FrontEfi uses a pre-reserved front gap, preserves data and disables SecureBoot.");
+    Log("/NonDest and /FrontEfi reject /GPT, /R and /FS. /U automatically detects the installed layout; front EFI updates disable SecureBoot.");
+    Log("Specify exactly one operation and one target. Unknown, duplicate, conflicting or malformed options are rejected.");
+    return 1;
 }
 
 static int Ventoy_CLI_NonDestInstall(PHY_DRIVE_INFO* pDrvInfo, CLI_CFG* pCfg)
 {
     int rc;
-    int TryId = 1;
 
     Log("Ventoy_CLI_NonDestInstall start ...");
 
@@ -309,17 +430,29 @@ static int Ventoy_CLI_NonDestInstall(PHY_DRIVE_INFO* pDrvInfo, CLI_CFG* pCfg)
         goto out;
     }
 
-    if (!PartResizePreCheck(NULL))
+    if (!PartResizePreCheck(NULL, pCfg->FrontEfi))
     {
         Log("#### Part Resize PreCheck Failed ####");
         rc = 1;
         goto out;
     }
 
+    if (pCfg->FrontEfi)
+    {
+        Log("Front EFI install target: PhysicalDrive%d Size:%llu bytes DataStartLBA:%llu SecureBoot:%d",
+            pDrvInfo->PhyDrive, pDrvInfo->SizeInBytes,
+            pDrvInfo->PartStyle ? pDrvInfo->Gpt.PartTbl[0].StartLBA : (UINT64)pDrvInfo->Gpt.MBR.PartTbl[0].StartSectorId,
+            g_SecureBoot);
+    }
+
     rc = PartitionResizeForVentoy(pDrvInfo);
 
 out:
     Log("Ventoy_CLI_NonDestInstall [%s]", rc == 0 ? "SUCCESS" : "FAILED");
+    if (pCfg->FrontEfi)
+    {
+        VentoyShowFrontEfiResult(pDrvInfo, rc == 0);
+    }
 
     return rc;
 }
@@ -384,8 +517,19 @@ static int Ventoy_CLI_Update(PHY_DRIVE_INFO* pDrvInfo, CLI_CFG* pCfg)
     
     Log("Ventoy_CLI_Update start ...");
 
+    if (pDrvInfo->FrontEfi)
+    {
+        if (!VentoyPrepareFrontUpdate(pDrvInfo))
+        {
+            rc = 1;
+            goto out;
+        }
+        Log("Front EFI update target: PhysicalDrive%d Size:%llu bytes DataStartLBA:%llu SecureBoot:%d",
+            pDrvInfo->PhyDrive, pDrvInfo->SizeInBytes, pDrvInfo->DataStartSector, g_SecureBoot);
+    }
+
     rc = UpdateVentoy2PhyDrive(pDrvInfo, TryId++);
-    if (rc)
+    if (rc && !pDrvInfo->FrontEfi)
     {
         Log("This time update failed, now wait and retry...");
         Sleep(4000);
@@ -409,7 +553,12 @@ static int Ventoy_CLI_Update(PHY_DRIVE_INFO* pDrvInfo, CLI_CFG* pCfg)
         }
     }
 
+out:
     Log("Ventoy_CLI_Update [%s]", rc == 0 ? "SUCCESS" : "FAILED");
+    if (pDrvInfo->FrontEfi)
+    {
+        VentoyShowFrontEfiResult(pDrvInfo, rc == 0);
+    }
 
     return rc;
 }
@@ -455,7 +604,7 @@ PHY_DRIVE_INFO* CLI_PhyDrvInfo(void)
 }
 
 /*
- * Ventoy2Disk.exe VTOYCLI  { /I | /U }  { /Drive:F: | /PhyDrive:1 }  /GPT  /NoSB  /R:4096 /NoUSBCheck
+ * Ventoy2Disk.exe VTOYCLI { /I | /U } { /Drive:F: | /PhyDrive:1 } [options]
  * 
  */
 int VentoyCLIMain(int argc, char** argv)
@@ -514,6 +663,7 @@ int VentoyCLIMain(int argc, char** argv)
     }
 
 end:
+    g_CLI_PhyDrvInfo = NULL;
     CHECK_FREE(pDrvInfo);
 
     CLI_UpdatePercent(PT_FINISH);

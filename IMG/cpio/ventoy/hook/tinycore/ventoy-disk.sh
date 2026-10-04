@@ -36,11 +36,7 @@ if [ "$vtdiskname" = "unknown" ]; then
     exit 0
 fi
 
-if echo $vtdiskname | egrep -q "nvme.*p[0-9]$|mmc.*p[0-9]$|nbd.*p[0-9]$"; then
-    vPart="${vtdiskname}p2"    
-else
-    vPart="${vtdiskname}2"
-fi
+vPart=$(ventoy_get_efi_part "$vtdiskname")
 
 # TinyCore linux distro doesn't contain dmsetup, we use aoe here
 sudo modprobe aoe aoe_iflist=lo

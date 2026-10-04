@@ -1,6 +1,7 @@
 #!/bin/sh
 
 . ./tool/ventoy_lib.sh
+. ./tool/front_efi.sh
 
 print_usage() {
 
@@ -17,6 +18,7 @@ print_usage() {
     echo '   -g          use GPT partition style, default is MBR (only for install)'
     echo '   -L          Label of the 1st exfat partition (default is Ventoy)'
     echo '   -n          try non-destructive installation (only for install)'
+    echo '   --front-efi use preallocated front space without moving data (install only; Secure Boot disabled)'
     echo ''
 }
 
@@ -31,6 +33,9 @@ while [ -n "$1" ]; do
         MODE="install"
         FORCE="Y"
     elif [ "$1" = "-n" ]; then
+        NONDESTRUCTIVE="Y"
+    elif [ "$1" = "--front-efi" ]; then
+        FRONT_EFI="Y"
         NONDESTRUCTIVE="Y"
     elif [ "$1" = "-u" ]; then
         MODE="update"
@@ -74,6 +79,11 @@ done
 
 if [ -z "$MODE" ]; then
     print_usage
+    exit 1
+fi
+
+if [ -n "$FRONT_EFI" ] && { [ "$MODE" != install ] || [ -n "$RESERVE_SPACE" ] || [ -n "$VTGPT" ]; }; then
+    vterr '--front-efi requires -i/-I and cannot be combined with -r or -g.'
     exit 1
 fi
 
@@ -160,19 +170,29 @@ else
 fi
 
 
-#check tmp_mnt directory
+# A stale mount must never be removed recursively.
 if [ -d ./tmp_mnt ]; then
-    vtdebug "There is a tmp_mnt directory, now delete it."
-    umount ./tmp_mnt >/dev/null 2>&1
-    rm -rf ./tmp_mnt
-    if [ -d ./tmp_mnt ]; then
-        vterr "tmp_mnt directory exists, please delete it first."
+    if mountpoint -q ./tmp_mnt; then
+        if ! umount ./tmp_mnt; then
+            vterr 'Cannot unmount ./tmp_mnt. Close applications using it, then retry. No installation was started.'
+            exit 1
+        fi
+    fi
+    if ! rmdir ./tmp_mnt; then
+        vterr './tmp_mnt is mounted or not empty. Inspect it and remove it manually only after checking its contents.'
         exit 1
     fi
 fi
 
 
-if [ "$MODE" = "install" -a -z "$NONDESTRUCTIVE" ]; then
+if [ "$MODE" = install ] && [ -n "$FRONT_EFI" ]; then
+    if get_disk_ventoy_version "$DISK" >/dev/null; then
+        vterr 'The disk already contains Ventoy. Use -u to update it.'
+        exit 1
+    fi
+    front_efi_write install
+    exit $?
+elif [ "$MODE" = "install" -a -z "$NONDESTRUCTIVE" ]; then
     vtdebug "install Ventoy ..."
 
     if [ -n "$VTGPT" ]; then
@@ -373,6 +393,11 @@ if [ "$MODE" = "install" -a -z "$NONDESTRUCTIVE" ]; then
 elif [ "$MODE" = "install" -a -n "$NONDESTRUCTIVE" ]; then
     vtdebug "non-destructive install Ventoy ..."
 
+    if [ "$(get_disk_efi_part_number "$DISK")" = 1 ]; then
+        vterr 'Front EFI is already installed. Use -u with the matching rebuilt package.'
+        exit 1
+    fi
+
     version=$(get_disk_ventoy_version $DISK)
     if [ $? -eq 0 ]; then
         if [ -z "$FORCE" ]; then
@@ -386,11 +411,12 @@ elif [ "$MODE" = "install" -a -n "$NONDESTRUCTIVE" ]; then
     disk_sector_num=$(cat /sys/block/${DISK#/dev/}/size)
     disk_size_gb=$(expr $disk_sector_num / 2097152)
 
-    if vtoycli partresize -t $DISK; then
-        OldStyle="GPT"
-    else
-        OldStyle="MBR"
-    fi
+    vtoycli partresize -t "$DISK"
+    case $? in
+        0) OldStyle="GPT" ;;
+        1) OldStyle="MBR" ;;
+        *) vterr 'Cannot read the partition table. Reconnect/check the disk before retrying.'; exit 1 ;;
+    esac
 
     #Print disk info
     echo "Disk : $DISK"
@@ -538,6 +564,16 @@ elif [ "$MODE" = "install" -a -n "$NONDESTRUCTIVE" ]; then
     
 else
     vtdebug "update Ventoy ..."
+
+    update_efi_part=$(get_disk_efi_part_number "$DISK") || {
+        vterr 'The existing partition layout could not be verified. Reconnect the disk and inspect it before retrying.'
+        vterr 'If a prior operation failed, keep its recovery folder. Do not use a normal install to repair the disk.'
+        exit 1
+    }
+    if [ "$update_efi_part" = 1 ]; then
+        front_efi_write update
+        exit $?
+    fi
     
     oldver=$(get_disk_ventoy_version $DISK)
     if [ $? -ne 0 ]; then
@@ -546,7 +582,8 @@ else
         else
             vtwarn "$DISK does not contain Ventoy or data corrupted"
             echo ""
-            vtwarn "Please use -i option if you want to install ventoy to $DISK"
+            vtwarn 'Reconnect the disk and check its layout. If this follows a failed operation, keep the recovery files and restore the disk before retrying.'
+            vtwarn 'A normal -i installation formats data; do not use it to repair an existing disk.'
             echo ""
             exit 1
         fi

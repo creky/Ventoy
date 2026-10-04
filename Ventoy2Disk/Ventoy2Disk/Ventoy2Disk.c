@@ -76,7 +76,7 @@ int ParseCmdLineOption(LPSTR lpCmdLine)
     return 0;
 }
 
-BOOL IsVentoyPhyDrive(int PhyDrive, UINT64 SizeBytes, MBR_HEAD *pMBR, UINT64 *Part2StartSector, UINT64 *GptPart2Attr)
+BOOL IsVentoyPhyDrive(int PhyDrive, UINT64 SizeBytes, MBR_HEAD *pMBR, UINT64 *Part2StartSector, UINT64 *GptPart2Attr, UINT64 *DataStartSector)
 {
     int i;
     BOOL bRet;
@@ -158,6 +158,16 @@ BOOL IsVentoyPhyDrive(int PhyDrive, UINT64 SizeBytes, MBR_HEAD *pMBR, UINT64 *Pa
             Log("PartTbl.Name = %S", pGpt->PartTbl[i].Name);
         }
 
+        if (VentoyValidateFrontLayout(pGpt, SizeBytes, TRUE))
+        {
+            *Part2StartSector = pGpt->PartTbl[0].StartLBA;
+            *GptPart2Attr = pGpt->PartTbl[0].Attr;
+            *DataStartSector = pGpt->PartTbl[1].StartLBA;
+            memcpy(pMBR, &pGpt->MBR, sizeof(*pMBR));
+            free(pGpt);
+            return TRUE;
+        }
+
 		if (memcmp(pGpt->PartTbl[1].Name, L"VTOYEFI", 7 * 2))
 		{
 			if (pGpt->PartTbl[1].Name[0])
@@ -213,6 +223,19 @@ BOOL IsVentoyPhyDrive(int PhyDrive, UINT64 SizeBytes, MBR_HEAD *pMBR, UINT64 *Pa
             Log("PartTbl.EndCylinder = %u", MBR.PartTbl[i].EndCylinder);
         }
 
+        {
+            VTOY_GPT_INFO layout = { 0 };
+            layout.MBR = MBR;
+            if (VentoyValidateFrontLayout(&layout, SizeBytes, TRUE))
+            {
+                *Part2StartSector = MBR.PartTbl[0].StartSectorId;
+                *DataStartSector = MBR.PartTbl[1].StartSectorId;
+                *GptPart2Attr = 0;
+                memcpy(pMBR, &MBR, sizeof(*pMBR));
+                return TRUE;
+            }
+        }
+
 		if (MBR.PartTbl[0].StartSectorId != 2048)
 		{
 			Log("Part1 not match %u", MBR.PartTbl[0].StartSectorId);
@@ -247,6 +270,8 @@ BOOL IsVentoyPhyDrive(int PhyDrive, UINT64 SizeBytes, MBR_HEAD *pMBR, UINT64 *Pa
         memcpy(pMBR, &MBR, sizeof(MBR_HEAD));
 	}
 
+    *DataStartSector = 2048;
+    if (pGpt) free(pGpt);
     Log("PhysicalDrive%d is ventoy disk", PhyDrive);
     return TRUE;
 }
@@ -286,7 +311,7 @@ int GetVentoyFsNameInPhyDrive(PHY_DRIVE_INFO* CurDrive)
     {
         if (GetPhyDriveByLogicalDrive(CurDrive->DriveLetters[i], &Offset) >= 0)
         {
-            if (Offset == SIZE_1MB)
+            if (Offset == CurDrive->DataStartSector * 512ULL)
             {
                 sprintf_s(Volume, sizeof(Volume), "%C:\\", CurDrive->DriveLetters[i]);
                 Log("Find the partition 1 logical drive is %s", Volume);
@@ -399,11 +424,12 @@ static int FilterPhysicalDrive(PHY_DRIVE_INFO *pDriveList, DWORD DriveCount)
             }
         }
 
-        if (IsVentoyPhyDrive(CurDrive->PhyDrive, CurDrive->SizeInBytes, &MBR, &Part2StartSector, &Part2GPTAttr))
+        if (IsVentoyPhyDrive(CurDrive->PhyDrive, CurDrive->SizeInBytes, &MBR, &Part2StartSector, &Part2GPTAttr, &CurDrive->DataStartSector))
         {
             memcpy(&(CurDrive->MBR), &MBR, sizeof(MBR));
             CurDrive->PartStyle = (MBR.PartTbl[0].FsFlag == 0xEE) ? 1 : 0;
             CurDrive->Part2GPTAttr = Part2GPTAttr;
+            CurDrive->FrontEfi = (Part2StartSector == 2048);
             GetVentoyVerInPhyDrive(CurDrive, Part2StartSector, CurDrive->VentoyVersion, sizeof(CurDrive->VentoyVersion), &(CurDrive->SecureBootSupport));
             Log("PhyDrive %d is Ventoy Disk ver:%s SecureBoot:%u", CurDrive->PhyDrive, CurDrive->VentoyVersion, CurDrive->SecureBootSupport);
 

@@ -498,6 +498,7 @@ static int vtoy_check_device(ventoy_os_param *param, const char *device)
 static int vtoy_print_os_param(ventoy_os_param *param, char *diskname)
 {
     int fd, size;
+    int efi_part;
     int cnt = 0;
     char *path = param->vtoy_img_path;
     const char *fs;
@@ -530,13 +531,14 @@ static int vtoy_print_os_param(ventoy_os_param *param, char *diskname)
 
     if (1 == cnt)
     {
+        efi_part = param->vtoy_disk_part_id == 2 ? 1 : 2;
         if (strstr(diskname, "nvme") || strstr(diskname, "mmc") || strstr(diskname, "nbd"))
         {
-            snprintf(diskpath, sizeof(diskpath) - 1, "/sys/class/block/%sp2/size", diskname);
+            snprintf(diskpath, sizeof(diskpath) - 1, "/sys/class/block/%sp%d/size", diskname, efi_part);
         }
         else
         {
-            snprintf(diskpath, sizeof(diskpath) - 1, "/sys/class/block/%s2/size", diskname);
+            snprintf(diskpath, sizeof(diskpath) - 1, "/sys/class/block/%s%d/size", diskname, efi_part);
         }
 
         if (param->vtoy_reserved[6] == 0 && access(diskpath, F_OK) >= 0)

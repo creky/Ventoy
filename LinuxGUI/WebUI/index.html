@@ -844,7 +844,9 @@
                 progressDisableItem(vtoy_in_progress);
                 queryProgress(2);
             } else {
-                ventoy_display_alert('error', vtoy_cur_language.STR_UPDATE_FAILED);
+                ventoy_display_alert('error', data.result === 'front_efi_cli' ?
+                    'Front EFI updates require the verified CLI updater: sudo sh Ventoy2Disk.sh -u /dev/' + curDev.name :
+                    vtoy_cur_language.STR_UPDATE_FAILED);
             }
         });
     }

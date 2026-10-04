@@ -62,11 +62,7 @@ if [ "$vtimgname" = "unknown" -o -z "$vtimgname" ]; then
     exit 0
 fi
 
-if echo "$vtdiskname" | $EGREP -q "nvme|mmc|nbd"; then
-    vtdatapart=${vtdiskname}p1
-else
-    vtdatapart=${vtdiskname}1
-fi
+vtdatapart=$(ventoy_get_image_part) || exit 1
 
 # rw: the holo hook mounts the image rootfs rw
 mkdir -p /run/ventoy-media

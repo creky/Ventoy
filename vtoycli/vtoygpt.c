@@ -149,6 +149,7 @@ int DumpGptInfo(VTOY_GPT_INFO *pGptInfo)
 int vtoygpt_main(int argc, char **argv)
 {
     int i;
+    int EfiIndex = 1;
     int fd;
     UINT64 DiskSize;
     CHAR16 *Name = NULL;
@@ -188,17 +189,22 @@ int vtoygpt_main(int argc, char **argv)
         lseek(fd, DiskSize - 33 * 512, SEEK_SET);
         read(fd, pBackGptInfo, sizeof(VTOY_BK_GPT_INFO));
 
-        Name = pMainGptInfo->PartTbl[1].Name;
+        if (pMainGptInfo->PartTbl[0].StartLBA == 2048 &&
+            pMainGptInfo->PartTbl[0].LastLBA == 67583 &&
+            pMainGptInfo->PartTbl[1].StartLBA >= 67584 &&
+            pMainGptInfo->PartTbl[0].Name[0] == 'V' && pMainGptInfo->PartTbl[0].Name[1] == 'T')
+            EfiIndex = 0;
+        Name = pMainGptInfo->PartTbl[EfiIndex].Name;
         if (Name[0] == 'V' && Name[1] == 'T' && Name[2] == 'O' && Name[3] == 'Y')
         {
-            if (pMainGptInfo->PartTbl[1].Attr != VENTOY_EFI_PART_ATTR)
+            if (pMainGptInfo->PartTbl[EfiIndex].Attr != VENTOY_EFI_PART_ATTR)
             {                
-                pMainGptInfo->PartTbl[1].Attr = VENTOY_EFI_PART_ATTR;
+                pMainGptInfo->PartTbl[EfiIndex].Attr = VENTOY_EFI_PART_ATTR;
                 pMainGptInfo->Head.PartTblCrc = VtoyCrc32(pMainGptInfo->PartTbl, sizeof(pMainGptInfo->PartTbl));
                 pMainGptInfo->Head.Crc = 0;
                 pMainGptInfo->Head.Crc = VtoyCrc32(&pMainGptInfo->Head, pMainGptInfo->Head.Length);
 
-                pBackGptInfo->PartTbl[1].Attr = VENTOY_EFI_PART_ATTR;
+                pBackGptInfo->PartTbl[EfiIndex].Attr = VENTOY_EFI_PART_ATTR;
                 pBackGptInfo->Head.PartTblCrc = VtoyCrc32(pBackGptInfo->PartTbl, sizeof(pBackGptInfo->PartTbl));
                 pBackGptInfo->Head.Crc = 0;
                 pBackGptInfo->Head.Crc = VtoyCrc32(&pBackGptInfo->Head, pBackGptInfo->Head.Length);

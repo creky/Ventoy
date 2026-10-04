@@ -504,8 +504,9 @@ dump_whole_iso_file() {
    $VTOY_PATH/tool/vtoydm -p -f $VTOY_PATH/ventoy_image_map -d $usb_disk | while read vtline; do
         vtlog "dmtable line: $vtline"
         vtcount=$(echo $vtline | $AWK '{print $2}')
+        vtdevice=$(echo $vtline | $AWK '{print $(NF-1)}')
         vtoffset=$(echo $vtline | $AWK '{print $NF}')
-        $BUSYBOX_PATH/dd if=$usb_disk of="$1" bs=512 count=$vtcount skip=$vtoffset oflag=append conv=notrunc 
+        $BUSYBOX_PATH/dd if="$vtdevice" of="$1" bs=512 count=$vtcount skip=$vtoffset oflag=append conv=notrunc
     done 
 }
 
@@ -571,11 +572,42 @@ ventoy_partname_to_diskname() {
 }
 
 ventoy_diskname_to_partname() {
-    if echo $1 | $EGREP -q "nvme.*p[0-9]$|mmc.*p[0-9]$|nbd.*p[0-9]$"; then
+    if echo $1 | $EGREP -q "nvme|mmc|nbd"; then
         echo -n "${1}p$2"
     else
         echo -n "${1}$2"
     fi
+}
+
+ventoy_get_efi_part() {
+    vtEfiFirst=$(ventoy_diskname_to_partname "$1" 1)
+    vtEfiSecond=$(ventoy_diskname_to_partname "$1" 2)
+    vtEfiType=$($BUSYBOX_PATH/hexdump -n 1 -s 450 -e '1/1 "%02x"' "$1") || return 1
+    vtEfiIdentity=0
+    if [ "$vtEfiType" = "ef" ]; then
+        vtEfiIdentity=1
+    elif [ "$vtEfiType" = "ee" ]; then
+        vtEfiName=$($BUSYBOX_PATH/hexdump -n 16 -s 1080 -e '16/1 "%02x"' "$1") || return 1
+        if [ "$vtEfiName" = "560054004f0059004500460049000000" ]; then
+            vtEfiIdentity=1
+        fi
+    fi
+    if [ "$vtEfiIdentity" = "1" ] &&
+       [ "$($CAT /sys/class/block/${vtEfiFirst##*/}/start 2>/dev/null)" = "2048" ] &&
+       [ "$($CAT /sys/class/block/${vtEfiFirst##*/}/size 2>/dev/null)" = "65536" ] &&
+       [ "$($CAT /sys/class/block/${vtEfiSecond##*/}/start 2>/dev/null)" -ge 67584 ] 2>/dev/null; then
+        echo "$vtEfiFirst"
+    elif [ "$vtEfiIdentity" = "1" ]; then
+        return 1
+    else
+        echo "$vtEfiSecond"
+    fi
+}
+
+ventoy_get_image_part() {
+    vtImageInfo=$($VTOY_PATH/tool/vtoydump -f $VTOY_PATH/ventoy_os_param) || return 1
+    vtImagePart=$($BUSYBOX_PATH/hexdump -n 2 -s 41 -e '1/2 "%u"' $VTOY_PATH/ventoy_os_param)
+    ventoy_diskname_to_partname "${vtImageInfo%%#*}" "$vtImagePart"
 }
 
 ventoy_udev_disk_common_hook() {    
@@ -619,7 +651,8 @@ ventoy_udev_disk_common_hook() {
     if [ "$2" = "noreplace" ]; then
         vtlog "no need to replace block device"
     else
-        ventoy_copy_device_mapper "/dev/$1"
+        # Partition 2 remains the discovery trigger; replace the EFI device only.
+        ventoy_copy_device_mapper "$(ventoy_get_efi_part "/dev/$VTDISK")"
     fi
     
     if [ -f $VTOY_PATH/ventoy_persistent_map ]; then
@@ -669,7 +702,7 @@ ventoy_create_wrapper_dm() {
     if [ "$2" = "noreplace" ]; then
         vtlog "no need to replace block device"
     else
-        ventoy_copy_device_mapper "/dev/$1"
+        ventoy_copy_device_mapper "$(ventoy_get_efi_part "/dev/$VTDISK")"
     fi
     
     if [ -f $VTOY_PATH/ventoy_persistent_map ]; then
@@ -798,7 +831,8 @@ ventoy_swap_device() {
 ventoy_extract_vtloopex() {
     vtCurPwd=$PWD
     $BUSYBOX_PATH/mkdir -p $VTOY_PATH/partmnt $VTOY_PATH/vtloopex
-    $BUSYBOX_PATH/mount -o ro -t vfat $1  $VTOY_PATH/partmnt
+    vtEfiPart=$(ventoy_get_efi_part "$(ventoy_partname_to_diskname "$1")")
+    $BUSYBOX_PATH/mount -o ro -t vfat "$vtEfiPart" $VTOY_PATH/partmnt || return 1
     cd $VTOY_PATH/vtloopex
     $CAT $VTOY_PATH/partmnt/ventoy/vtloopex.cpio | $BUSYBOX_PATH/cpio -idm >> $VTLOG 2>&1
     $BUSYBOX_PATH/umount $VTOY_PATH/partmnt

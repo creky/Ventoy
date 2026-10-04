@@ -602,6 +602,14 @@ void Ventoy2DiskWindow::on_ButtonUpdate_clicked()
         return;
     }
 
+    if (cur->vtoydata.front_efi)
+    {
+        QMessageBox::information(NULL, title_info,
+            QString("Front EFI updates require the verified CLI updater:\nsudo sh Ventoy2Disk.sh -u %1")
+                .arg(cur->disk_path));
+        return;
+    }
+
     lang_string("STR_UPDATE_TIP", msg);
     if (QMessageBox::Yes != QMessageBox::information(NULL, title_info, msg, QMessageBox::Yes | QMessageBox::No, QMessageBox::No))
     {

@@ -121,6 +121,8 @@ int g_ventoy_disk_bios_id = 0;
 ventoy_gpt_info *g_ventoy_part_info = NULL;
 grub_uint64_t g_ventoy_disk_size = 0;
 grub_uint64_t g_ventoy_disk_part_size[2];
+static int g_ventoy_data_part_id = 1;
+static int g_ventoy_efi_part_id = 2;
 
 char *g_tree_script_buf = NULL;
 int g_tree_script_pos = 0;
@@ -573,9 +575,9 @@ static int ventoy_check_official_device(grub_device_t dev)
         return ventoy_set_check_result(1 | 0x1000, "Internal Error");
     }
 
-    if (0 == ventoy_check_file_exist("(%s,2)/ventoy/ventoy.cpio", dev->disk->name) ||
-        0 == ventoy_check_file_exist("(%s,2)/grub/localboot.cfg", dev->disk->name) ||
-        0 == ventoy_check_file_exist("(%s,2)/tool/mount.exfat-fuse_aarch64", dev->disk->name))
+    if (0 == ventoy_check_file_exist("(%s,%d)/ventoy/ventoy.cpio", dev->disk->name, g_ventoy_efi_part_id) ||
+        0 == ventoy_check_file_exist("(%s,%d)/grub/localboot.cfg", dev->disk->name, g_ventoy_efi_part_id) ||
+        0 == ventoy_check_file_exist("(%s,%d)/tool/mount.exfat-fuse_aarch64", dev->disk->name, g_ventoy_efi_part_id))
     {
         #ifndef GRUB_MACHINE_EFI
         if (0 == ventoy_check_file_exist("(ventoydisk)/ventoy/ventoy.cpio", dev->disk->name))
@@ -597,14 +599,14 @@ static int ventoy_check_official_device(grub_device_t dev)
         #endif
     }
 
-    /* We must have partition 2 */
+    /* Open the EFI partition, or its BIOS compatibility image. */
     if (workaround)
     {
         file = ventoy_grub_file_open(VENTOY_FILE_TYPE, "%s", "(ventoydisk)/ventoy/ventoy.cpio");
     }
     else
     {
-        file = ventoy_grub_file_open(VENTOY_FILE_TYPE, "(%s,2)/ventoy/ventoy.cpio", dev->disk->name);
+        file = ventoy_grub_file_open(VENTOY_FILE_TYPE, "(%s,%d)/ventoy/ventoy.cpio", dev->disk->name, g_ventoy_efi_part_id);
     }
     if (!file)
     {
@@ -618,39 +620,18 @@ static int ventoy_check_official_device(grub_device_t dev)
     }
 
     partition = dev->disk->partition;
-    if (partition->number != 0 || partition->start != 2048)
+    if (partition->number + 1 != g_ventoy_data_part_id)
     {
-        return ventoy_set_check_result(5, "Ventoy partition is not start at 1MB");
+        grub_file_close(file);
+        return ventoy_set_check_result(5, "Ventoy data partition number mismatch");
     }
 
-    if (workaround)
+    if (!workaround)
     {
-        if (grub_strncmp(g_ventoy_part_info->Head.Signature, "EFI PART", 8) == 0)
-        {
-            ventoy_gpt_part_tbl *PartTbl = g_ventoy_part_info->PartTbl;
-            if (PartTbl[1].StartLBA != PartTbl[0].LastLBA + 1 ||
-                (PartTbl[1].LastLBA + 1 - PartTbl[1].StartLBA) != 65536)
-            {
-                grub_file_close(file);
-                return ventoy_set_check_result(6, "Disk partition layout check failed.");
-            }
-        }
-        else
-        {
-            ventoy_part_table *PartTbl = g_ventoy_part_info->MBR.PartTbl;
-            if (PartTbl[1].StartSectorId != PartTbl[0].StartSectorId + PartTbl[0].SectorCount ||
-                PartTbl[1].SectorCount != 65536)
-            {
-                grub_file_close(file);
-                return ventoy_set_check_result(6, "Disk partition layout check failed.");
-            }
-        }
-    }
-    else
-    {
-        offset = partition->start + partition->len;
+        offset = (g_ventoy_efi_part_id == 1) ? 2048 : partition->start + partition->len;
         partition = file->device->disk->partition;
-        if ((partition->number != 1) || (partition->len != 65536) || (offset != partition->start))
+        if (!partition || (partition->number + 1 != g_ventoy_efi_part_id) ||
+            (partition->len != 65536) || (offset != partition->start))
         {
             grub_file_close(file);
             return ventoy_set_check_result(7, "Disk partition layout check failed.");
@@ -661,7 +642,7 @@ static int ventoy_check_official_device(grub_device_t dev)
 
     if (workaround == 0)
     {
-        grub_snprintf(devname, sizeof(devname), "%s,2", dev->disk->name);
+        grub_snprintf(devname, sizeof(devname), "%s,%d", dev->disk->name, g_ventoy_efi_part_id);
         dev2 = grub_device_open(devname);
         if (!dev2)
         {
@@ -5098,6 +5079,11 @@ int ventoy_load_part_table(const char *diskname)
 {
     char name[64];
     int ret;
+    int i;
+    int front_efi;
+    const grub_uint16_t efi_name[] = {'V', 'T', 'O', 'Y', 'E', 'F', 'I', 0};
+    grub_uint64_t start[2];
+    grub_uint64_t sectors[2];
     grub_disk_t disk;
     grub_device_t dev;
 
@@ -5118,10 +5104,71 @@ int ventoy_load_part_table(const char *diskname)
 
     g_ventoy_disk_bios_id = disk->id;
 
-    grub_disk_read(disk, 0, 0, sizeof(ventoy_gpt_info), g_ventoy_part_info);
+    ret = grub_disk_read(disk, 0, 0, sizeof(ventoy_gpt_info), g_ventoy_part_info);
     grub_disk_close(disk);
+    if (ret)
+    {
+        return 1;
+    }
 
-    grub_snprintf(name, sizeof(name), "%s,1", diskname);
+    for (i = 0; i < 2; i++)
+    {
+        if (grub_strncmp(g_ventoy_part_info->Head.Signature, "EFI PART", 8) == 0)
+        {
+            start[i] = g_ventoy_part_info->PartTbl[i].StartLBA;
+            if (g_ventoy_part_info->PartTbl[i].LastLBA < start[i] ||
+                g_ventoy_part_info->PartTbl[i].LastLBA == (grub_uint64_t)-1)
+            {
+                return ventoy_set_check_result(6, "Disk partition range check failed.");
+            }
+            sectors[i] = g_ventoy_part_info->PartTbl[i].LastLBA - start[i] + 1;
+        }
+        else
+        {
+            start[i] = g_ventoy_part_info->MBR.PartTbl[i].StartSectorId;
+            sectors[i] = g_ventoy_part_info->MBR.PartTbl[i].SectorCount;
+        }
+        if (!sectors[i] || start[i] > (grub_uint64_t)-1 - sectors[i] ||
+            sectors[i] > ((grub_uint64_t)-1 >> 9))
+        {
+            return ventoy_set_check_result(6, "Disk partition range check failed.");
+        }
+#ifdef GRUB_MACHINE_EFI
+        if (start[i] >= g_ventoy_disk_size / 512 ||
+            sectors[i] > g_ventoy_disk_size / 512 - start[i])
+        {
+            return ventoy_set_check_result(6, "Disk partition range check failed.");
+        }
+#endif
+    }
+
+    if (grub_strncmp(g_ventoy_part_info->Head.Signature, "EFI PART", 8) == 0)
+    {
+        front_efi = (grub_memcmp(g_ventoy_part_info->PartTbl[0].Name, efi_name, sizeof(efi_name)) == 0);
+    }
+    else
+    {
+        front_efi = (g_ventoy_part_info->MBR.PartTbl[0].FsFlag == 0xEF);
+    }
+
+    if (front_efi && start[0] == 2048 && sectors[0] == 65536 && start[1] >= 67584)
+    {
+        g_ventoy_data_part_id = 2;
+        g_ventoy_efi_part_id = 1;
+        grub_env_set("VTOY_FRONT_EFI", "VTOY_FRONT_EFI_V1");
+    }
+    else if (start[0] == 2048 && start[1] == start[0] + sectors[0] && sectors[1] == 65536)
+    {
+        g_ventoy_data_part_id = 1;
+        g_ventoy_efi_part_id = 2;
+        grub_env_unset("VTOY_FRONT_EFI");
+    }
+    else
+    {
+        return ventoy_set_check_result(6, "Disk partition layout check failed.");
+    }
+
+    grub_snprintf(name, sizeof(name), "%s,%d", diskname, g_ventoy_data_part_id);
     dev = grub_device_open(name);
     if (dev)
     {
@@ -5135,8 +5182,18 @@ int ventoy_load_part_table(const char *diskname)
         }
     }
 
-    g_ventoy_disk_part_size[0] = ventoy_get_vtoy_partsize(0);
-    g_ventoy_disk_part_size[1] = ventoy_get_vtoy_partsize(1);
+    else
+    {
+        return ventoy_set_check_result(8, "Data partition open failed");
+    }
+
+    /* These slots describe roles, not partition table indices. */
+    g_ventoy_disk_part_size[0] = ventoy_get_vtoy_partsize(g_ventoy_data_part_id - 1);
+    g_ventoy_disk_part_size[1] = ventoy_get_vtoy_partsize(g_ventoy_efi_part_id - 1);
+    grub_snprintf(name, sizeof(name), "(%s,%d)", diskname, g_ventoy_data_part_id);
+    grub_env_set("vtoy_iso_part", name);
+    grub_snprintf(name, sizeof(name), "(%s,%d)", diskname, g_ventoy_efi_part_id);
+    grub_env_set("vtoy_efi_part", name);
 
     return 0;
 }
@@ -5208,9 +5265,6 @@ static grub_err_t ventoy_cmd_load_part_table(grub_extcmd_context_t ctxt, int arg
     {
         ventoy_prompt_end();
     }
-
-    g_ventoy_disk_part_size[0] = ventoy_get_vtoy_partsize(0);
-    g_ventoy_disk_part_size[1] = ventoy_get_vtoy_partsize(1);
 
     return 0;
 }

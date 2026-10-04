@@ -165,6 +165,22 @@ typedef struct ventoy_secure_data
 
 #define VENTOY_MAX_PHY_DRIVE  128
 
+typedef enum VTOY_FRONT_ERROR
+{
+    FRONT_ERR_NONE, FRONT_ERR_SECTOR, FRONT_ERR_LAYOUT, FRONT_ERR_SPACE,
+    FRONT_ERR_PACKAGE, FRONT_ERR_BACKUP_LOCATION, FRONT_ERR_VOLUME_QUERY,
+    FRONT_ERR_VOLUME_BUSY, FRONT_ERR_DISK_CHANGED, FRONT_ERR_BACKUP_IO,
+    FRONT_ERR_MEMORY, FRONT_ERR_IMAGE, FRONT_ERR_DISK_IO, FRONT_ERR_WORKER,
+    FRONT_ERR_ALREADY_INSTALLED, FRONT_ERR_NO_VOLUME, FRONT_ERR_SYSTEM_DISK,
+    FRONT_ERR_PARTITION_SLOTS, FRONT_ERR_UNSUPPORTED_DISK
+} VTOY_FRONT_ERROR;
+
+typedef enum VTOY_FRONT_STATE
+{
+    FRONT_STATE_UNTOUCHED, FRONT_STATE_CHANGED, FRONT_STATE_RESTORED,
+    FRONT_STATE_RESTORE_FAILED, FRONT_STATE_COMPLETE
+} VTOY_FRONT_STATE;
+
 typedef struct PHY_DRIVE_INFO
 {
     int Id;
@@ -191,8 +207,14 @@ typedef struct PHY_DRIVE_INFO
     BOOL SecureBootSupport;
     MBR_HEAD MBR;
     UINT64 Part2GPTAttr;
+    BOOL FrontEfi;
+    UINT64 DataStartSector;
+    int FrontEfiError;
+    int FrontEfiState;
+    CHAR FrontBackupPath[MAX_PATH];
 
 	BOOL ResizeNoShrink;
+    BOOL ResizeFrontEfi;
 	UINT64 ResizeOldPart1Size;
 	CHAR Part1DriveLetter;
     CHAR ResizeVolumeGuid[64];
@@ -300,7 +322,12 @@ int FindProcessOccupyDisk(HANDLE hDrive, PHY_DRIVE_INFO *pPhyDrive);
 int VentoyFillMBRLocation(UINT64 DiskSizeInBytes, UINT32 StartSectorId, UINT32 SectorCount, PART_TABLE *Table);
 int ClearVentoyFromPhyDrive(HWND hWnd, PHY_DRIVE_INFO *pPhyDrive, char *pDrvLetter);
 UINT32 VentoyCrc32(void *Buffer, UINT32 Length);
-BOOL PartResizePreCheck(PHY_DRIVE_INFO** ppPhyDrive);
+BOOL PartResizePreCheck(PHY_DRIVE_INFO** ppPhyDrive, BOOL FrontEfi);
+BOOL VentoyValidateFrontLayout(const VTOY_GPT_INFO *Gpt, UINT64 DiskBytes, BOOL Installed);
+BOOL VentoyCheckFrontLayout(const VTOY_GPT_INFO *Gpt, UINT64 DiskBytes, BOOL Installed, int *Reason);
+BOOL VentoyCheckFrontEfiPackage(void);
+BOOL VentoyPrepareFrontUpdate(PHY_DRIVE_INFO *pPhyDrive);
+void VentoyShowFrontEfiResult(PHY_DRIVE_INFO *pPhyDrive, BOOL Success);
 
 #define SET_FILE_POS(pos) \
     liCurrentPosition.QuadPart = pos; \
@@ -375,7 +402,7 @@ void VentoyStringToUpper(CHAR* str);
 BOOL AlertSuppressInit(void);
 void SetAlertPromptHookEnable(BOOL enable);
 int VentoyCLIMain(int argc, char** argv);
-BOOL IsVentoyPhyDrive(int PhyDrive, UINT64 SizeBytes, MBR_HEAD* pMBR, UINT64* Part2StartSector, UINT64* GptPart2Attr);
+BOOL IsVentoyPhyDrive(int PhyDrive, UINT64 SizeBytes, MBR_HEAD* pMBR, UINT64* Part2StartSector, UINT64* GptPart2Attr, UINT64 *DataStartSector);
 int GetVentoyFsNameInPhyDrive(PHY_DRIVE_INFO* CurDrive);
 void CLISetReserveSpace(int MB);
 void CLI_UpdatePercent(int Pos);

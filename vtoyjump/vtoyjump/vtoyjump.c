@@ -952,13 +952,14 @@ static CHAR GetIMDiskMountLogicalDrive(const char *suffix)
     return Letter;
 }
 
-UINT64 GetVentoyEfiPartStartSector(HANDLE hDrive)
+UINT64 GetVentoyPartStartSector(HANDLE hDrive, BOOL EfiPart)
 {
     BOOL bRet;
     DWORD dwSize;
     MBR_HEAD MBR;
     VTOY_GPT_INFO *pGpt = NULL;
     UINT64 StartSector = 0;
+    int EfiIndex = -1;
 
     SetFilePointer(hDrive, 0, NULL, FILE_BEGIN);
 
@@ -967,7 +968,7 @@ UINT64 GetVentoyEfiPartStartSector(HANDLE hDrive)
 
     if ((!bRet) || (dwSize != sizeof(MBR)))
     {
-        0;
+        return 0;
     }
 
     if (MBR.PartTbl[0].FsFlag == 0xEE)
@@ -985,19 +986,52 @@ UINT64 GetVentoyEfiPartStartSector(HANDLE hDrive)
         if ((!bRet) || (dwSize != sizeof(VTOY_GPT_INFO)))
         {
             Log("Failed to read gpt info %d %u %d", bRet, dwSize, LASTERR);
+            free(pGpt);
             return 0;
         }
 
-        StartSector = pGpt->PartTbl[1].StartLBA;
+        if (pGpt->PartTbl[0].StartLBA == 2048 &&
+            pGpt->PartTbl[0].LastLBA == 67583 &&
+            pGpt->PartTbl[1].StartLBA >= 67584 &&
+            memcmp(pGpt->PartTbl[0].Name, L"VTOYEFI", 14) == 0)
+        {
+            EfiIndex = 0;
+        }
+        else if (pGpt->PartTbl[0].StartLBA == 2048 &&
+                 pGpt->PartTbl[1].StartLBA == pGpt->PartTbl[0].LastLBA + 1 &&
+                 memcmp(pGpt->PartTbl[1].Name, L"VTOYEFI", 14) == 0)
+        {
+            EfiIndex = 1;
+        }
+        if (EfiIndex >= 0)
+        {
+            StartSector = pGpt->PartTbl[EfiPart ? EfiIndex : 1 - EfiIndex].StartLBA;
+        }
         free(pGpt);
     }
     else
     {
         Log("MBR partition style");
-        StartSector = MBR.PartTbl[1].StartSectorId;
+        if (MBR.PartTbl[0].FsFlag == 0xEF &&
+            MBR.PartTbl[0].StartSectorId == 2048 &&
+            MBR.PartTbl[0].SectorCount == 65536 &&
+            MBR.PartTbl[1].StartSectorId >= 67584)
+        {
+            EfiIndex = 0;
+        }
+        else if (MBR.PartTbl[0].StartSectorId == 2048 &&
+                 MBR.PartTbl[1].StartSectorId == (UINT64)2048 + MBR.PartTbl[0].SectorCount &&
+                 MBR.PartTbl[1].FsFlag == 0xEF)
+        {
+            EfiIndex = 1;
+        }
+        if (EfiIndex >= 0)
+        {
+            StartSector = MBR.PartTbl[EfiPart ? EfiIndex : 1 - EfiIndex].StartSectorId;
+        }
     }
 
-    Log("GetVentoyEfiPart StartSector: %llu", StartSector);
+    Log("VTOY_FRONT_EFI_V1 %s StartSector: %llu", EfiPart ? "EFI" : "Data", StartSector);
     return StartSector;
 }
 
@@ -1040,7 +1074,11 @@ static int VentoyCopyImdisk(DWORD PhyDrive, CHAR *ImPath)
     }
 
     g_FatPhyDrive = hDrive;
-    g_Part2StartSec = GetVentoyEfiPartStartSector(hDrive);
+    g_Part2StartSec = GetVentoyPartStartSector(hDrive, TRUE);
+    if (g_Part2StartSec == 0)
+    {
+        goto End;
+    }
 
     Log("Parse FAT fs...");
 
@@ -1435,7 +1473,11 @@ static int DecompressInjectionArchive(const char *archive, DWORD PhyDrive)
     }
 
     g_FatPhyDrive = hDrive;
-    g_Part2StartSec = GetVentoyEfiPartStartSector(hDrive);
+    g_Part2StartSec = GetVentoyPartStartSector(hDrive, TRUE);
+    if (g_Part2StartSec == 0)
+    {
+        goto End;
+    }
 
     Log("Parse FAT fs...");
 
@@ -2567,11 +2609,25 @@ static int VentoyHook(ventoy_os_param *param)
                     if (GetPhyDiskUUID(VtoyLetter, UUID, &DiskSig, &VtoyDiskExtent) == 0)
                     {
                         Log("[%d] DiskSig=%08X PartStart=%lld", i, DiskSig, VtoyDiskExtent.StartingOffset.QuadPart);
-                        if (DiskSig == VtoySig && VtoyDiskExtent.StartingOffset.QuadPart == SIZE_1MB)
+                        if (DiskSig == VtoySig)
                         {
-                            Log("Ventoy Disk Sig and offset match");
-                            vtoyfind = TRUE;
-                            break;
+                            HANDLE hVtoyDrive;
+                            UINT64 DataStart = 0;
+                            CHAR PhyPath[MAX_PATH];
+                            sprintf_s(PhyPath, sizeof(PhyPath), "\\\\.\\PhysicalDrive%u", VtoyDiskExtent.DiskNumber);
+                            hVtoyDrive = CreateFileA(PhyPath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                                    NULL, OPEN_EXISTING, 0, NULL);
+                            if (hVtoyDrive != INVALID_HANDLE_VALUE)
+                            {
+                                DataStart = GetVentoyPartStartSector(hVtoyDrive, FALSE);
+                                CloseHandle(hVtoyDrive);
+                            }
+                            if (DataStart && VtoyDiskExtent.StartingOffset.QuadPart == DataStart * 512)
+                            {
+                                Log("Ventoy Disk Sig and data offset match");
+                                vtoyfind = TRUE;
+                                break;
+                            }
                         }
                     }
                 }

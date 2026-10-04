@@ -24,6 +24,8 @@
 #include <grub/term.h>
 #include <grub/file.h>
 #include <grub/device.h>
+#include <grub/fs.h>
+#include <grub/partition.h>
 #include <grub/env.h>
 #include <grub/mm.h>
 #include <grub/command.h>
@@ -261,6 +263,53 @@ grub_set_prefix_and_root (void)
 	  grub_free (prefix_set);
 	}
       grub_env_set ("root", device);
+
+      if (grub_strncmp(device, "hd", 2) == 0)
+        {
+          char *drive = grub_strdup(device);
+          char *comma;
+          char *label = NULL;
+          char name[128];
+          int part;
+          grub_file_t file;
+
+          if (drive)
+            {
+              comma = grub_strchr(drive, ',');
+              if (comma) *comma = 0;
+              for (part = 2; part >= 1; part--)
+                {
+                  grub_snprintf(name, sizeof(name), "(%s,%d)/grub/grub.cfg", drive, part);
+                  file = grub_file_open(name, GRUB_FILE_TYPE_NONE);
+                  if (!file)
+                    {
+                      grub_errno = 0;
+                      continue;
+                    }
+                  if (file->device->disk && file->device->disk->partition &&
+                      file->device->disk->partition->len == 65536 && file->fs->fs_label)
+                    {
+                      file->fs->fs_label(file->device, &label);
+                      if (label && grub_strcmp(label, "VTOYEFI") == 0)
+                        {
+                          grub_snprintf(name, sizeof(name), "%s,%d", drive, part);
+                          grub_env_set("root", name);
+                          grub_snprintf(name, sizeof(name), "(%s,%d)/grub", drive, part);
+                          grub_env_set("prefix", name);
+                          grub_env_set("vtoy_boot_layout_support", "VTOY_FRONT_EFI_V1");
+                          grub_free(label);
+                          grub_file_close(file);
+                          break;
+                        }
+                      grub_free(label);
+                      label = NULL;
+                    }
+                  grub_file_close(file);
+                  grub_errno = 0;
+                }
+              grub_free(drive);
+            }
+        }
     }
 
   grub_free (device);
@@ -312,6 +361,7 @@ static int ventoy_legacy_limit_workaround(void)
     grub_file_t file;
     char *pos, *root;
     char buf[128];
+    int part;
 
     root = grub_strdup(grub_env_get("root"));
     if (!root)
@@ -322,8 +372,13 @@ static int ventoy_legacy_limit_workaround(void)
     pos = grub_strchr(root, ',');
     if (pos) *pos = 0;
 
-    grub_snprintf(buf, sizeof(buf), "(%s,1)/ventoy/ventoy.disk.img.xz", root);
-    file = grub_file_open(buf, GRUB_FILE_TYPE_NONE);
+    file = NULL;
+    for (part = 1; part <= 2 && !file; part++)
+    {
+        grub_snprintf(buf, sizeof(buf), "(%s,%d)/ventoy/ventoy.disk.img.xz", root, part);
+        file = grub_file_open(buf, GRUB_FILE_TYPE_NONE);
+        if (!file) grub_errno = 0;
+    }
     if (file)
     {
         pos = grub_malloc(file->size);

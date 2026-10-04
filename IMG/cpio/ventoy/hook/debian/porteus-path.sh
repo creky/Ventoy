@@ -25,14 +25,10 @@ VTPATH_OLD=$PATH; PATH=$BUSYBOX_PATH:$VTOY_PATH/tool:$PATH
 
 wait_for_usb_disk_ready
 
-vtdiskname=$(get_ventoy_disk_name)
+vtdatapart=$(ventoy_get_image_part) || exit 1
 
 vtPath=$(vtoydump -p $VTOY_PATH/ventoy_os_param)
 
-if echo $vtdiskname | egrep -q "nvme|mmc|nbd"; then
-    echo ${vtdiskname}p1${vtPath} > /porteus-from
-else
-    echo ${vtdiskname}1${vtPath} > /porteus-from
-fi
+echo "${vtdatapart}${vtPath}" > /porteus-from
 
 PATH=$VTPATH_OLD

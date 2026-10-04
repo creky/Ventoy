@@ -439,6 +439,8 @@ int ventoy_get_vtoy_data(ventoy_disk *info, int *ppartstyle)
     int rc = 1;
     int ret = 1;
     int part_style;
+    int efi_index = 1;
+    int data_index = 0;
     uint64_t part1_start_sector;
     uint64_t part1_sector_count;
     uint64_t part2_start_sector;
@@ -496,9 +498,16 @@ int ventoy_get_vtoy_data(ventoy_disk *info, int *ppartstyle)
             goto end;
         }
 
+        if (gpt->PartTbl[0].StartLBA == 2048 &&
+            gpt->PartTbl[0].LastLBA == 67583 && gpt->PartTbl[1].StartLBA >= 67584 &&
+            gpt->PartTbl[0].Name[0] == 'V' && gpt->PartTbl[0].Name[1] == 'T')
+        {
+            efi_index = 0;
+            data_index = 1;
+        }
         for (i = 0; i < 36; i++)
         {
-            name[i] = (char)(gpt->PartTbl[1].Name[i]);
+            name[i] = (char)(gpt->PartTbl[efi_index].Name[i]);
         }
         if (strcmp(name, "VTOYEFI"))
         {
@@ -506,10 +515,10 @@ int ventoy_get_vtoy_data(ventoy_disk *info, int *ppartstyle)
             goto end;
         }
 
-        part1_start_sector = gpt->PartTbl[0].StartLBA;
-        part1_sector_count = gpt->PartTbl[0].LastLBA - part1_start_sector + 1;
-        part2_start_sector = gpt->PartTbl[1].StartLBA;
-        part2_sector_count = gpt->PartTbl[1].LastLBA - part2_start_sector + 1;
+        part1_start_sector = gpt->PartTbl[data_index].StartLBA;
+        part1_sector_count = gpt->PartTbl[data_index].LastLBA - part1_start_sector + 1;
+        part2_start_sector = gpt->PartTbl[efi_index].StartLBA;
+        part2_sector_count = gpt->PartTbl[efi_index].LastLBA - part2_start_sector + 1;
 
         preserved_space = info->size_in_byte - (part2_start_sector + part2_sector_count + 33) * 512;
     }
@@ -521,17 +530,26 @@ int ventoy_get_vtoy_data(ventoy_disk *info, int *ppartstyle)
             *ppartstyle = part_style;
         }
         
-        part1_start_sector = gpt->MBR.PartTbl[0].StartSectorId;
-        part1_sector_count = gpt->MBR.PartTbl[0].SectorCount;
-        part2_start_sector = gpt->MBR.PartTbl[1].StartSectorId;
-        part2_sector_count = gpt->MBR.PartTbl[1].SectorCount;
+        if (gpt->MBR.PartTbl[0].StartSectorId == 2048 &&
+            gpt->MBR.PartTbl[0].SectorCount == 65536 &&
+            gpt->MBR.PartTbl[0].FsFlag == 0xEF && gpt->MBR.PartTbl[1].StartSectorId >= 67584)
+        {
+            efi_index = 0;
+            data_index = 1;
+        }
+        part1_start_sector = gpt->MBR.PartTbl[data_index].StartSectorId;
+        part1_sector_count = gpt->MBR.PartTbl[data_index].SectorCount;
+        part2_start_sector = gpt->MBR.PartTbl[efi_index].StartSectorId;
+        part2_sector_count = gpt->MBR.PartTbl[efi_index].SectorCount;
 
         preserved_space = info->size_in_byte - (part2_start_sector + part2_sector_count) * 512;
     }
 
-    if (part1_start_sector != VTOYIMG_PART_START_SECTOR ||
-        part2_sector_count != VTOYEFI_PART_SECTORS ||
-        (part1_start_sector + part1_sector_count) != part2_start_sector)
+    if (part2_sector_count != VTOYEFI_PART_SECTORS || !part1_sector_count ||
+        (efi_index == 1 && (part1_start_sector != VTOYIMG_PART_START_SECTOR ||
+         part1_start_sector + part1_sector_count != part2_start_sector)) ||
+        (efi_index == 0 && (part1_start_sector < 67584 || part1_start_sector >= info->size_in_byte / 512 ||
+         part1_sector_count > info->size_in_byte / 512 - part1_start_sector)))
     {
         vdebug("Not valid ventoy partition layout [%llu %llu] [%llu %llu]\n", 
                part1_start_sector, part1_sector_count, part2_start_sector, part2_sector_count);
@@ -541,6 +559,20 @@ int ventoy_get_vtoy_data(ventoy_disk *info, int *ppartstyle)
     vdebug("ventoy partition layout check OK: [%llu %llu] [%llu %llu]\n", 
                part1_start_sector, part1_sector_count, part2_start_sector, part2_sector_count);
 
+    vtoy->front_efi = (efi_index == 0);
+    if (vtoy->front_efi)
+    {
+        uint64_t last = part1_start_sector + part1_sector_count;
+        for (i = 2; i < (part_style == GPT_PART_STYLE ? 128 : 4); i++)
+        {
+            uint64_t end = part_style == GPT_PART_STYLE ?
+                gpt->PartTbl[i].LastLBA + 1 :
+                (uint64_t)gpt->MBR.PartTbl[i].StartSectorId + gpt->MBR.PartTbl[i].SectorCount;
+            if (end > last) last = end;
+        }
+        preserved_space = last <= info->size_in_byte / 512 - (part_style == GPT_PART_STYLE ? 33 : 0) ?
+            info->size_in_byte - (last + (part_style == GPT_PART_STYLE ? 33 : 0)) * 512 : 0;
+    }
     vtoy->ventoy_valid = 1;
 
     vdebug("now check secure boot for %s ...\n", info->disk_path);

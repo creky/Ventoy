@@ -111,6 +111,7 @@ typedef struct VTOY_GPT_INFO
 typedef struct disk_ventoy_data
 {
     int ventoy_valid;
+    int front_efi;
     
     char ventoy_ver[32];  // 1.0.33 ...
     int  secure_boot_flag;

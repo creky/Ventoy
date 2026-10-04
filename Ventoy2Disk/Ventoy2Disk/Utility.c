@@ -19,7 +19,201 @@
  *
  */
 #include <Windows.h>
+#include <wincrypt.h>
+#include <limits.h>
 #include "Ventoy2Disk.h"
+
+BOOL VentoyCheckFrontLayout(const VTOY_GPT_INFO *Gpt, UINT64 DiskBytes, BOOL Installed, int *Reason)
+{
+    int i, j, count = 0;
+    int ignored;
+    int data = Installed ? 1 : 0;
+    int limit = Gpt->MBR.PartTbl[0].FsFlag == 0xEE ? 128 : 4;
+    UINT64 start[128] = { 0 }, end[128] = { 0 };
+    UINT64 last = DiskBytes / 512;
+    GUID zero = { 0 };
+    static const GUID unsupported[] = {
+        { 0xaf9b60a0, 0x1431, 0x4f62, { 0xbc, 0x68, 0x33, 0x11, 0x71, 0x4a, 0x69, 0xad } },
+        { 0x5808c8aa, 0x7e8f, 0x42e0, { 0x85, 0xd2, 0xe1, 0xe9, 0x04, 0x34, 0xcf, 0xb3 } },
+        { 0xe75caf8f, 0xf680, 0x4cee, { 0xaf, 0xa3, 0xb0, 0x01, 0xe5, 0x6e, 0xfc, 0x2d } },
+        { 0xe7addcb4, 0xdc34, 0x4539, { 0x9a, 0x76, 0xeb, 0xbd, 0x07, 0xbe, 0x6f, 0x7e } }
+    };
+    VTOY_GPT_HDR head;
+
+    if (!Reason) Reason = &ignored;
+    *Reason = FRONT_ERR_LAYOUT;
+
+    if (DiskBytes % 512 || last <= 67584 || Gpt->MBR.Byte55 != 0x55 || Gpt->MBR.ByteAA != 0xAA)
+        return FALSE;
+
+    if (limit == 128)
+    {
+        head = Gpt->Head;
+        if (memcmp(head.Signature, "EFI PART", 8) || head.Length != 92 ||
+            head.EfiStartLBA != 1 || head.EfiBackupLBA != last - 1 ||
+            head.PartTblStartLBA != 2 || head.PartTblTotNum != 128 || head.PartTblEntryLen != 128 ||
+            head.PartAreaStartLBA < 34 || head.PartAreaStartLBA > 2048 ||
+            head.PartAreaEndLBA >= last - 33 || head.PartAreaEndLBA < 67584)
+            return FALSE;
+        head.Crc = 0;
+        if (VentoyCrc32(&head, head.Length) != Gpt->Head.Crc ||
+            VentoyCrc32((void *)Gpt->PartTbl, sizeof(Gpt->PartTbl)) != head.PartTblCrc)
+            return FALSE;
+        last = head.PartAreaEndLBA + 1;
+        for (i = 1; i < 4; i++)
+            if (Gpt->MBR.PartTbl[i].SectorCount) return FALSE;
+    }
+
+    for (i = 0; i < limit; i++)
+    {
+        if (limit == 128)
+        {
+            if (!memcmp(&Gpt->PartTbl[i].PartType, &zero, sizeof(zero)))
+                continue;
+            if (!memcmp(&Gpt->PartTbl[i].PartGuid, &zero, sizeof(zero)) ||
+                Gpt->PartTbl[i].LastLBA >= last)
+                return FALSE;
+            for (j = 0; j < sizeof(unsupported) / sizeof(unsupported[0]); j++)
+                if (!memcmp(&Gpt->PartTbl[i].PartType, &unsupported[j], sizeof(GUID)))
+                { *Reason = FRONT_ERR_UNSUPPORTED_DISK; return FALSE; }
+            start[i] = Gpt->PartTbl[i].StartLBA;
+            end[i] = Gpt->PartTbl[i].LastLBA + 1;
+        }
+        else
+        {
+            const PART_TABLE *part = &Gpt->MBR.PartTbl[i];
+            if (!part->SectorCount) continue;
+            if (!part->FsFlag || part->FsFlag == 0x05 || part->FsFlag == 0x0F ||
+                part->FsFlag == 0x85 || part->FsFlag == 0x42 || part->FsFlag == 0xEE ||
+                part->FsFlag == 0xD7 || part->FsFlag == 0xE7)
+                { *Reason = FRONT_ERR_UNSUPPORTED_DISK; return FALSE; }
+            start[i] = part->StartSectorId;
+            end[i] = start[i] + part->SectorCount;
+        }
+        if (!Installed && start[i] < 67584ULL)
+            { *Reason = FRONT_ERR_SPACE; return FALSE; }
+        if (start[i] < ((Installed && i == 0) ? 2048ULL : 67584ULL) ||
+            end[i] <= start[i] || end[i] > last)
+            return FALSE;
+        count++;
+        for (j = 0; j < i; j++)
+            if (end[j] && start[i] < end[j] && start[j] < end[i]) return FALSE;
+    }
+    if (!end[data]) return FALSE;
+    if (!Installed && count == limit)
+        { *Reason = FRONT_ERR_PARTITION_SLOTS; return FALSE; }
+    if (!Installed)
+    {
+        if (limit == 128)
+        {
+            static const GUID basic = { 0xebd0a0a2, 0xb9e5, 0x4433, { 0x87, 0xc0, 0x68, 0xb6, 0xb7, 0x26, 0x99, 0xc7 } };
+            static const GUID linuxData = { 0x0fc63daf, 0x8483, 0x4772, { 0x8e, 0x79, 0x3d, 0x69, 0xd8, 0x47, 0x7d, 0xe4 } };
+            if (memcmp(&Gpt->PartTbl[0].PartType, &basic, sizeof(GUID)) &&
+                memcmp(&Gpt->PartTbl[0].PartType, &linuxData, sizeof(GUID))) return FALSE;
+        }
+        else
+        {
+            BYTE type = Gpt->MBR.PartTbl[0].FsFlag;
+            if (type != 0x07 && type != 0x0B && type != 0x0C && type != 0x06 && type != 0x0E && type != 0x83)
+                return FALSE;
+        }
+    }
+    for (i = data + 1; i < limit; i++)
+        if (end[i] && start[i] < end[data]) return FALSE;
+    if (Installed)
+    {
+        if (start[0] != 2048 || end[0] != 67584) return FALSE;
+        if (limit == 128)
+        {
+            if (memcmp(Gpt->PartTbl[0].Name, L"VTOYEFI", 7 * sizeof(WCHAR))) return FALSE;
+        }
+        else if (Gpt->MBR.PartTbl[0].FsFlag != 0xEF) return FALSE;
+    }
+    *Reason = FRONT_ERR_NONE;
+    return TRUE;
+}
+
+BOOL VentoyValidateFrontLayout(const VTOY_GPT_INFO *Gpt, UINT64 DiskBytes, BOOL Installed)
+{
+    return VentoyCheckFrontLayout(Gpt, DiskBytes, Installed, NULL);
+}
+
+BOOL VentoyCheckFrontEfiPackage(void)
+{
+    static const char *paths[] = { "boot/boot.img", "boot/core.img.xz", "ventoy/ventoy.disk.img.xz" };
+    FILE *manifest = NULL, *file = NULL;
+    HCRYPTPROV provider = 0;
+    HCRYPTHASH hash = 0;
+    BYTE buffer[65536], digest[32];
+    char line[256], expected[65], path[160], actual[65];
+    DWORD length;
+    size_t bytes;
+    int i, j;
+    BOOL ok = FALSE;
+
+    if (fopen_s(&manifest, "ventoy/front-efi.sha256", "rb") || !manifest)
+        goto out;
+    if (!CryptAcquireContext(&provider, NULL, NULL, PROV_RSA_AES, CRYPT_VERIFYCONTEXT))
+        goto out;
+    for (i = 0; i < 3; i++)
+    {
+        if (!fgets(line, sizeof(line), manifest) ||
+            sscanf_s(line, "%64s %159s", expected, (unsigned)sizeof(expected), path, (unsigned)sizeof(path)) != 2 ||
+            strlen(expected) != 64 || strcmp(path, paths[i]))
+            goto out;
+        if (fopen_s(&file, paths[i], "rb") || !file ||
+            !CryptCreateHash(provider, CALG_SHA_256, 0, 0, &hash)) goto out;
+        while ((bytes = fread(buffer, 1, sizeof(buffer), file)) != 0)
+            if (!CryptHashData(hash, buffer, (DWORD)bytes, 0)) goto out;
+        if (ferror(file)) goto out;
+        fclose(file);
+        file = NULL;
+        length = sizeof(digest);
+        if (!CryptGetHashParam(hash, HP_HASHVAL, digest, &length, 0) || length != sizeof(digest)) goto out;
+        CryptDestroyHash(hash);
+        hash = 0;
+        for (j = 0; j < 32; j++) sprintf_s(actual + j * 2, 3, "%02x", digest[j]);
+        if (_stricmp(actual, expected)) goto out;
+    }
+    if (fgets(line, sizeof(line), manifest) || ferror(manifest)) goto out;
+    ok = TRUE;
+out:
+    if (file) fclose(file);
+    if (manifest) fclose(manifest);
+    if (hash) CryptDestroyHash(hash);
+    if (provider) CryptReleaseContext(provider, 0);
+    if (!ok) Log("Front EFI requires a rebuilt package with a valid ventoy/front-efi.sha256 manifest.");
+    return ok;
+}
+
+BOOL VentoyPrepareFrontUpdate(PHY_DRIVE_INFO *pPhyDrive)
+{
+    HANDLE disk = INVALID_HANDLE_VALUE;
+    VTOY_GPT_INFO table;
+    DWORD bytes;
+    BOOL ok = FALSE;
+
+    pPhyDrive->FrontEfiState = FRONT_STATE_UNTOUCHED;
+    pPhyDrive->FrontBackupPath[0] = 0;
+    pPhyDrive->FrontEfiError = FRONT_ERR_SECTOR;
+    if (pPhyDrive->BytesPerLogicalSector != 512) return FALSE;
+    pPhyDrive->FrontEfiError = FRONT_ERR_PACKAGE;
+    if (!VentoyCheckFrontEfiPackage()) return FALSE;
+    pPhyDrive->FrontEfiError = FRONT_ERR_DISK_CHANGED;
+    if (!VentoyPhydriveMatch(pPhyDrive)) return FALSE;
+    disk = GetPhysicalHandle(pPhyDrive->PhyDrive, FALSE, FALSE, FALSE);
+    if (disk == INVALID_HANDLE_VALUE) return FALSE;
+    pPhyDrive->FrontEfiError = FRONT_ERR_DISK_IO;
+    if (!ReadFile(disk, &table, sizeof(table), &bytes, NULL) || bytes != sizeof(table)) goto out;
+    pPhyDrive->FrontEfiError = FRONT_ERR_DISK_CHANGED;
+    if (memcmp(&table.MBR, &pPhyDrive->MBR, sizeof(table.MBR))) goto out;
+    if (!VentoyCheckFrontLayout(&table, pPhyDrive->SizeInBytes, TRUE, &pPhyDrive->FrontEfiError)) goto out;
+    pPhyDrive->Gpt = table;
+    ok = TRUE;
+out:
+    CHECK_CLOSE_HANDLE(disk);
+    return ok;
+}
 
 void TraceOut(const char *Fmt, ...)
 {
@@ -218,10 +412,13 @@ int SaveBufToFile(const CHAR *FileName, const void *Buffer, int BufLen)
 
 int ReadWholeFileToBuf(const CHAR *FileName, int ExtLen, void **Bufer, int *BufLen)
 {
-    int FileSize;
+    __int64 FileSize;
     FILE *File = NULL;
     void *Data = NULL;
 
+    *Bufer = NULL;
+    *BufLen = 0;
+    if (ExtLen < 0) return 1;
     fopen_s(&File, FileName, "rb");
     if (File == NULL)
     {
@@ -229,25 +426,21 @@ int ReadWholeFileToBuf(const CHAR *FileName, int ExtLen, void **Bufer, int *BufL
         return 1;
     }
 
-    fseek(File, 0, SEEK_END);
-    FileSize = (int)ftell(File);
-
-    Data = malloc(FileSize + ExtLen);
-    if (!Data)
-    {
-        fclose(File);
-        return 1;
-    }
-
-    fseek(File, 0, SEEK_SET);
-    fread(Data, 1, FileSize, File);
-
-    fclose(File);
+    if (_fseeki64(File, 0, SEEK_END) || (FileSize = _ftelli64(File)) <= 0 ||
+        FileSize > INT_MAX - ExtLen || _fseeki64(File, 0, SEEK_SET)) goto failed;
+    Data = malloc((size_t)FileSize + ExtLen);
+    if (!Data || fread(Data, 1, (size_t)FileSize, File) != (size_t)FileSize || ferror(File)) goto failed;
+    if (ExtLen) memset((BYTE *)Data + (size_t)FileSize, 0, ExtLen);
+    if (fclose(File)) { File = NULL; goto failed; }
 
     *Bufer = Data;
-    *BufLen = FileSize;
-
+    *BufLen = (int)FileSize;
     return 0;
+failed:
+    Log("Failed to read the complete file: %s", FileName);
+    if (File) fclose(File);
+    free(Data);
+    return 1;
 }
 
 const CHAR* GetLocalVentoyVersion(void)
@@ -1076,6 +1269,11 @@ int VentoyGetLocalBootImg(MBR_HEAD *pMBR)
 
     if (0 == ReadWholeFileToBuf(VENTOY_FILE_BOOT_IMG, 0, (void **)&ImgBuf, &Len))
     {
+        if (Len != 512)
+        {
+            free(ImgBuf);
+            return 1;
+        }
         Log("Copy boot img success");
         memcpy(pMBR, ImgBuf, 512);
         free(ImgBuf);

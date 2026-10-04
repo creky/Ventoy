@@ -544,198 +544,72 @@ int GetAllPhysicalDriveInfo(PHY_DRIVE_INFO *pDriveList, DWORD *pDriveCount)
     return 0;
 }
 
-BOOL VentoyPhydriveMatch(PHY_DRIVE_INFO* pPhyDrive)
+static BOOL VentoyPhydriveMatchHandle(PHY_DRIVE_INFO *pPhyDrive, HANDLE Handle)
 {
-    BOOL  bRet = FALSE;
-    DWORD dwBytes;
-    HANDLE Handle = INVALID_HANDLE_VALUE;
-    CHAR PhyDrive[128];
-    GET_LENGTH_INFORMATION LengthInfo;
-    STORAGE_PROPERTY_QUERY Query;
-    STORAGE_DESCRIPTOR_HEADER DevDescHeader;
-    STORAGE_DEVICE_DESCRIPTOR* pDevDesc = NULL;
-    STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR diskAlignment;
-    CHAR VendorId[128] = { 0 };
-    CHAR ProductId[128] = { 0 };
-    CHAR ProductRev[128] = { 0 };
-    CHAR SerialNumber[128] = { 0 };
+    BOOL matched = FALSE;
+    DWORD bytes, offsets[4];
+    int i;
+    GET_LENGTH_INFORMATION length;
+    STORAGE_PROPERTY_QUERY query = { 0 };
+    STORAGE_DESCRIPTOR_HEADER header;
+    STORAGE_DEVICE_DESCRIPTOR *desc = NULL;
+    STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR alignment = { 0 };
+    const char *expected[4] = { pPhyDrive->VendorId, pPhyDrive->ProductId,
+        pPhyDrive->ProductRev, pPhyDrive->SerialNumber };
+    CHAR value[128];
 
-
-    safe_sprintf(PhyDrive, "\\\\.\\PhysicalDrive%d", pPhyDrive->PhyDrive);
-    Handle = CreateFileA(PhyDrive, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-    if (Handle == INVALID_HANDLE_VALUE)
+    if (!DeviceIoControl(Handle, IOCTL_DISK_GET_LENGTH_INFO, NULL, 0,
+            &length, sizeof(length), &bytes, NULL) || bytes < sizeof(length) ||
+        (UINT64)length.Length.QuadPart != pPhyDrive->SizeInBytes) goto out;
+    query.PropertyId = StorageDeviceProperty;
+    query.QueryType = PropertyStandardQuery;
+    if (!DeviceIoControl(Handle, IOCTL_STORAGE_QUERY_PROPERTY, &query, sizeof(query),
+            &header, sizeof(header), &bytes, NULL) || bytes < sizeof(header) ||
+        header.Size < sizeof(*desc) || header.Size > SIZE_1MB) goto out;
+    desc = malloc(header.Size);
+    if (!desc) goto out;
+    if (!DeviceIoControl(Handle, IOCTL_STORAGE_QUERY_PROPERTY, &query, sizeof(query),
+            desc, header.Size, &bytes, NULL) || bytes < sizeof(*desc) || bytes > header.Size) goto out;
+    if (desc->DeviceType != pPhyDrive->DeviceType || desc->RemovableMedia != pPhyDrive->RemovableMedia ||
+        desc->BusType != pPhyDrive->BusType) goto out;
+    offsets[0] = desc->VendorIdOffset;
+    offsets[1] = desc->ProductIdOffset;
+    offsets[2] = desc->ProductRevisionOffset;
+    offsets[3] = desc->SerialNumberOffset;
+    for (i = 0; i < 4; i++)
     {
-        Log("Create file Handle:%p %s status:%u", Handle, PhyDrive, LASTERR);
-        return FALSE;
-    }
-
-    bRet = DeviceIoControl(Handle,
-        IOCTL_DISK_GET_LENGTH_INFO, NULL,
-        0,
-        &LengthInfo,
-        sizeof(LengthInfo),
-        &dwBytes,
-        NULL);
-    if (!bRet)
-    {
-        Log("DeviceIoControl IOCTL_DISK_GET_LENGTH_INFO failed error:%u", LASTERR);
-        return FALSE;
-    }
-
-    if (pPhyDrive->SizeInBytes != (ULONGLONG)LengthInfo.Length.QuadPart)
-    {
-        Log("PHYSICALDRIVE%d size not match %llu %llu", pPhyDrive->PhyDrive, (ULONGLONG)LengthInfo.Length.QuadPart,
-            (ULONGLONG)pPhyDrive->SizeInBytes);
-        CHECK_CLOSE_HANDLE(Handle);
-        return FALSE;
-    }
-
-    Query.PropertyId = StorageDeviceProperty;
-    Query.QueryType = PropertyStandardQuery;
-
-    bRet = DeviceIoControl(Handle,
-        IOCTL_STORAGE_QUERY_PROPERTY,
-        &Query,
-        sizeof(Query),
-        &DevDescHeader,
-        sizeof(STORAGE_DESCRIPTOR_HEADER),
-        &dwBytes,
-        NULL);
-    if (!bRet)
-    {
-        Log("DeviceIoControl1 error:%u dwBytes:%u", LASTERR, dwBytes);
-        CHECK_CLOSE_HANDLE(Handle);
-        return FALSE;
-    }
-
-    if (DevDescHeader.Size < sizeof(STORAGE_DEVICE_DESCRIPTOR))
-    {
-        Log("Invalid DevDescHeader.Size:%u", DevDescHeader.Size);
-        CHECK_CLOSE_HANDLE(Handle);
-        return FALSE;
-    }
-
-    pDevDesc = (STORAGE_DEVICE_DESCRIPTOR*)malloc(DevDescHeader.Size);
-    if (!pDevDesc)
-    {
-        Log("failed to malloc error:%u len:%u", LASTERR, DevDescHeader.Size);
-        CHECK_CLOSE_HANDLE(Handle);
-        return FALSE;
-    }
-
-    bRet = DeviceIoControl(Handle,
-        IOCTL_STORAGE_QUERY_PROPERTY,
-        &Query,
-        sizeof(Query),
-        pDevDesc,
-        DevDescHeader.Size,
-        &dwBytes,
-        NULL);
-    if (!bRet)
-    {
-        Log("DeviceIoControl2 error:%u dwBytes:%u", LASTERR, dwBytes);
-        free(pDevDesc);
-        goto out;
-    }
-
-
-
-    memset(&Query, 0, sizeof(STORAGE_PROPERTY_QUERY));
-    Query.PropertyId = StorageAccessAlignmentProperty;
-    Query.QueryType = PropertyStandardQuery;
-    memset(&diskAlignment, 0, sizeof(STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR));
-
-    bRet = DeviceIoControl(Handle,
-        IOCTL_STORAGE_QUERY_PROPERTY,
-        &Query,
-        sizeof(STORAGE_PROPERTY_QUERY),
-        &diskAlignment,
-        sizeof(STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR),
-        &dwBytes,
-        NULL);
-    if (!bRet)
-    {
-        Log("DeviceIoControl3 error:%u dwBytes:%u", LASTERR, dwBytes);
-    }
-
-    if (pPhyDrive->DeviceType != pDevDesc->DeviceType ||
-        pPhyDrive->RemovableMedia != pDevDesc->RemovableMedia ||
-        pPhyDrive->BusType != pDevDesc->BusType ||
-        pPhyDrive->BytesPerLogicalSector != diskAlignment.BytesPerLogicalSector ||
-        pPhyDrive->BytesPerPhysicalSector != diskAlignment.BytesPerPhysicalSector
-        )
-    {
-        Log("Some properties not match DeviceType[%u %u] Removable[%u %u] BusType[%u %u] LogSec[%u %u] PhySec[%u %u]", 
-            pPhyDrive->DeviceType, pDevDesc->DeviceType,
-            pPhyDrive->RemovableMedia, pDevDesc->RemovableMedia,
-            pPhyDrive->BusType, pDevDesc->BusType,
-            pPhyDrive->BytesPerLogicalSector, diskAlignment.BytesPerLogicalSector,
-            pPhyDrive->BytesPerPhysicalSector, diskAlignment.BytesPerPhysicalSector
-            );
-        goto out;
-    }
-
-    if (pDevDesc->VendorIdOffset)
-    {
-        safe_strcpy(VendorId, (char*)pDevDesc + pDevDesc->VendorIdOffset);
-        TrimString(VendorId);
-
-        if (strcmp(pPhyDrive->VendorId, VendorId))
+        value[0] = 0;
+        if (offsets[i])
         {
-            Log("VendorId not match <%s %s>", pPhyDrive->VendorId, VendorId);
-            goto out;
+            if (offsets[i] >= bytes || !memchr((BYTE *)desc + offsets[i], 0, bytes - offsets[i])) goto out;
+            safe_strcpy(value, (char *)desc + offsets[i]);
+            TrimString(value);
         }
+        if (strcmp(value, expected[i])) goto out;
     }
-
-    if (pDevDesc->ProductIdOffset)
-    {
-        safe_strcpy(ProductId, (char*)pDevDesc + pDevDesc->ProductIdOffset);
-        TrimString(ProductId);
-
-        if (strcmp(pPhyDrive->ProductId, ProductId))
-        {
-            Log("ProductId not match <%s %s>", pPhyDrive->ProductId, ProductId);
-            goto out;
-        }
-    }
-
-    if (pDevDesc->ProductRevisionOffset)
-    {
-        safe_strcpy(ProductRev, (char*)pDevDesc + pDevDesc->ProductRevisionOffset);
-        TrimString(ProductRev);
-
-        if (strcmp(pPhyDrive->ProductRev, ProductRev))
-        {
-            Log("ProductRev not match <%s %s>", pPhyDrive->ProductRev, ProductRev);
-            goto out;
-        }
-    }
-
-    if (pDevDesc->SerialNumberOffset)
-    {
-        safe_strcpy(SerialNumber, (char*)pDevDesc + pDevDesc->SerialNumberOffset);
-        TrimString(SerialNumber);
-
-        if (strcmp(pPhyDrive->SerialNumber, SerialNumber))
-        {
-            Log("ProductRev not match <%s %s>", pPhyDrive->SerialNumber, SerialNumber);
-            goto out;
-        }
-    }
-
-    Log("PhyDrive%d ALL match, now continue", pPhyDrive->PhyDrive);
-
-    bRet = TRUE;
-
+    query.PropertyId = StorageAccessAlignmentProperty;
+    if (!DeviceIoControl(Handle, IOCTL_STORAGE_QUERY_PROPERTY, &query, sizeof(query),
+            &alignment, sizeof(alignment), &bytes, NULL) || bytes < sizeof(alignment) ||
+        alignment.BytesPerLogicalSector != pPhyDrive->BytesPerLogicalSector ||
+        alignment.BytesPerPhysicalSector != pPhyDrive->BytesPerPhysicalSector) goto out;
+    matched = TRUE;
 out:
-    if (pDevDesc)
-    {
-        free(pDevDesc);
-    }
+    free(desc);
+    if (!matched) Log("PhysicalDrive%d identity does not match the selected disk.", pPhyDrive->PhyDrive);
+    return matched;
+}
 
-    CHECK_CLOSE_HANDLE(Handle);
-
-    return bRet;
+BOOL VentoyPhydriveMatch(PHY_DRIVE_INFO *pPhyDrive)
+{
+    BOOL matched;
+    HANDLE handle;
+    CHAR name[64];
+    safe_sprintf(name, "\\\\.\\PhysicalDrive%d", pPhyDrive->PhyDrive);
+    handle = CreateFileA(name, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (handle == INVALID_HANDLE_VALUE) return FALSE;
+    matched = VentoyPhydriveMatchHandle(pPhyDrive, handle);
+    CloseHandle(handle);
+    return matched;
 }
 
 static HANDLE g_FatPhyDrive;
@@ -849,8 +723,8 @@ int GetVentoyVerInPhyDrive(const PHY_DRIVE_INFO *pDriveInfo, UINT64 Part2StartSe
 
 
 
-static unsigned int g_disk_unxz_len = 0;
-static BYTE *g_part_img_pos = NULL;
+static BOOL g_part_img_split = FALSE;
+static BOOL g_fat_mem_error = FALSE;
 static BYTE *g_part_img_buf[VENTOY_EFI_PART_SIZE / SIZE_1MB];
 
 
@@ -859,6 +733,12 @@ static int VentoyFatMemRead(uint32 Sector, uint8 *Buffer, uint32 SectorCount)
 	uint32 i;
 	uint32 offset;
 	BYTE *MbBuf = NULL;
+
+	if (Sector > VENTOY_EFI_PART_SIZE / 512 || SectorCount > VENTOY_EFI_PART_SIZE / 512 - Sector)
+	{
+		g_fat_mem_error = TRUE;
+		return 0;
+	}
 
 	for (i = 0; i < SectorCount; i++)
 	{
@@ -886,6 +766,12 @@ static int VentoyFatMemWrite(uint32 Sector, uint8 *Buffer, uint32 SectorCount)
 	uint32 offset;
 	BYTE *MbBuf = NULL;
 
+	if (Sector > VENTOY_EFI_PART_SIZE / 512 || SectorCount > VENTOY_EFI_PART_SIZE / 512 - Sector)
+	{
+		g_fat_mem_error = TRUE;
+		return 0;
+	}
+
 	for (i = 0; i < SectorCount; i++)
 	{
 		offset = (Sector + i) * 512;
@@ -907,145 +793,98 @@ static int VentoyFatMemWrite(uint32 Sector, uint8 *Buffer, uint32 SectorCount)
 
 int VentoyProcSecureBoot(BOOL SecureBoot)
 {
-	int rc = 0;
-	int size;
-	char *filebuf = NULL;
-	void *file = NULL;
+    int arch, i, offset, size, chunk, rc = 1;
+    BYTE *filebuf[2] = { NULL, NULL };
+    int sizes[2] = { 0, 0 };
+    BYTE check[4096];
+    void *file = NULL;
+    static const char *source[2] = { "/EFI/BOOT/grubx64_real.efi", "/EFI/BOOT/grubia32_real.efi" };
+    static const char *target[2] = { "/EFI/BOOT/BOOTX64.EFI", "/EFI/BOOT/BOOTIA32.EFI" };
+    static const char *removeFiles[] = {
+        "/EFI/BOOT/BOOTX64.EFI", "/EFI/BOOT/grubx64.efi", "/EFI/BOOT/grubx64_real.efi",
+        "/EFI/BOOT/MokManager.efi", "/EFI/BOOT/mmx64.efi", "/ENROLL_THIS_KEY_IN_MOKMANAGER.cer",
+        "/EFI/BOOT/grub.efi", "/EFI/BOOT/BOOTIA32.EFI", "/EFI/BOOT/grubia32.efi",
+        "/EFI/BOOT/grubia32_real.efi", "/EFI/BOOT/mmia32.efi"
+    };
 
-	Log("VentoyProcSecureBoot %d ...", SecureBoot);
-	
-	if (SecureBoot)
-	{
-		Log("Secure boot is enabled ...");
-		return 0;
-	}
+    Log("VentoyProcSecureBoot %d ...", SecureBoot);
+    if (SecureBoot) return 0;
+    g_fat_mem_error = FALSE;
+    fl_init();
+    if (fl_attach_media(VentoyFatMemRead, VentoyFatMemWrite)) goto out;
 
-	fl_init();
-
-	if (0 == fl_attach_media(VentoyFatMemRead, VentoyFatMemWrite))
-	{
-		file = fl_fopen("/EFI/BOOT/grubx64_real.efi", "rb");
-		Log("Open ventoy efi file %p ", file);
-		if (file)
-		{
-			fl_fseek(file, 0, SEEK_END);
-			size = (int)fl_ftell(file);
-			fl_fseek(file, 0, SEEK_SET);
-
-			Log("ventoy efi file size %d ...", size);
-
-			filebuf = (char *)malloc(size);
-			if (filebuf)
-			{
-				fl_fread(filebuf, 1, size, file);
-			}
-
-			fl_fclose(file);
-
-			Log("Now delete all efi files ...");
-            fl_remove("/EFI/BOOT/BOOTX64.EFI");            
-            fl_remove("/EFI/BOOT/grubx64.efi");            
-			fl_remove("/EFI/BOOT/grubx64_real.efi");
-			fl_remove("/EFI/BOOT/MokManager.efi");
-			fl_remove("/EFI/BOOT/mmx64.efi");
-            fl_remove("/ENROLL_THIS_KEY_IN_MOKMANAGER.cer");
-            fl_remove("/EFI/BOOT/grub.efi");
-
-			file = fl_fopen("/EFI/BOOT/BOOTX64.EFI", "wb");
-			Log("Open bootx64 efi file %p ", file);
-			if (file)
-			{
-				if (filebuf)
-				{
-					fl_fwrite(filebuf, 1, size, file);
-				}
-				
-				fl_fflush(file);
-				fl_fclose(file);
-			}
-
-			if (filebuf)
-			{
-				free(filebuf);
-			}
-		}
-
-        file = fl_fopen("/EFI/BOOT/grubia32_real.efi", "rb");
-        Log("Open ventoy efi file %p ", file);
+    /* Prepare both replacements before changing the in-memory filesystem. */
+    for (arch = 0; arch < 2; arch++)
+    {
+        file = fl_fopen(source[arch], "rb");
+        if (!file || fl_fseek(file, 0, SEEK_END)) goto out;
+        size = (int)fl_ftell(file);
+        if (size <= 0 || size > VENTOY_EFI_PART_SIZE || fl_fseek(file, 0, SEEK_SET)) goto out;
+        filebuf[arch] = malloc(size);
+        if (!filebuf[arch] || fl_fread(filebuf[arch], 1, size, file) != size || g_fat_mem_error) goto out;
+        sizes[arch] = size;
+        fl_fclose(file);
+        file = NULL;
+    }
+    for (i = 0; i < sizeof(removeFiles) / sizeof(removeFiles[0]); i++)
+    {
+        file = fl_fopen(removeFiles[i], "rb");
         if (file)
         {
-            fl_fseek(file, 0, SEEK_END);
-            size = (int)fl_ftell(file);
-            fl_fseek(file, 0, SEEK_SET);
-
-            Log("ventoy efi file size %d ...", size);
-
-            filebuf = (char *)malloc(size);
-            if (filebuf)
-            {
-                fl_fread(filebuf, 1, size, file);
-            }
-
             fl_fclose(file);
-
-            Log("Now delete all efi files ...");
-            fl_remove("/EFI/BOOT/BOOTIA32.EFI");
-            fl_remove("/EFI/BOOT/grubia32.efi");
-            fl_remove("/EFI/BOOT/grubia32_real.efi");
-            fl_remove("/EFI/BOOT/mmia32.efi");            
-
-            file = fl_fopen("/EFI/BOOT/BOOTIA32.EFI", "wb");
-            Log("Open bootia32 efi file %p ", file);
-            if (file)
-            {
-                if (filebuf)
-                {
-                    fl_fwrite(filebuf, 1, size, file);
-                }
-
-                fl_fflush(file);
-                fl_fclose(file);
-            }
-
-            if (filebuf)
-            {
-                free(filebuf);
-            }
+            file = NULL;
+            if (fl_remove(removeFiles[i]) || g_fat_mem_error) goto out;
         }
+        else if (g_fat_mem_error) goto out;
+    }
+    for (arch = 0; arch < 2; arch++)
+    {
+        file = fl_fopen(target[arch], "wb");
+        if (!file || fl_fwrite(filebuf[arch], 1, sizes[arch], file) != sizes[arch] ||
+            fl_fflush(file) || g_fat_mem_error) goto out;
+        fl_fclose(file);
+        file = NULL;
+        if (g_fat_mem_error) goto out;
 
-	}
-	else
-	{
-		rc = 1;
-	}
-
-	fl_shutdown();
-
-	return rc;
+        /* fclose has no status; reopen to check directory length and written bytes. */
+        file = fl_fopen(target[arch], "rb");
+        if (!file || fl_fseek(file, 0, SEEK_END) || fl_ftell(file) != sizes[arch] ||
+            fl_fseek(file, 0, SEEK_SET)) goto out;
+        for (offset = 0; offset < sizes[arch]; offset += chunk)
+        {
+            chunk = min((int)sizeof(check), sizes[arch] - offset);
+            if (fl_fread(check, 1, chunk, file) != chunk ||
+                memcmp(check, filebuf[arch] + offset, chunk) || g_fat_mem_error) goto out;
+        }
+        fl_fclose(file);
+        file = NULL;
+    }
+    rc = 0;
+out:
+    if (file) fl_fclose(file);
+    fl_shutdown();
+    if (g_fat_mem_error) rc = 1;
+    free(filebuf[0]);
+    free(filebuf[1]);
+    if (rc) Log("Failed to prepare or verify non-secure EFI files.");
+    return rc;
 }
 
-
+static BYTE **g_unxz_blocks;
+static unsigned int g_unxz_block_size, g_unxz_capacity, g_unxz_written;
 
 static int disk_xz_flush(void *src, unsigned int size)
 {
-    unsigned int i;
-    BYTE *buf = (BYTE *)src;
-
-    for (i = 0; i < size; i++)
+    unsigned int copied = 0, chunk, offset;
+    if (size > g_unxz_capacity - g_unxz_written) return -1;
+    while (copied < size)
     {
-        *g_part_img_pos = *buf++;
-
-        g_disk_unxz_len++;
-        if ((g_disk_unxz_len % SIZE_1MB) == 0)
-        {
-            g_part_img_pos = g_part_img_buf[g_disk_unxz_len / SIZE_1MB];
-        }
-        else
-        {
-            g_part_img_pos++;
-        }
+        offset = g_unxz_written % g_unxz_block_size;
+        chunk = min(size - copied, g_unxz_block_size - offset);
+        memcpy(g_unxz_blocks[g_unxz_written / g_unxz_block_size] + offset, (BYTE *)src + copied, chunk);
+        copied += chunk;
+        g_unxz_written += chunk;
     }
-
     return (int)size;
 }
 
@@ -1082,246 +921,134 @@ static BOOL TryWritePart2(HANDLE hDrive, UINT64 StartSectorId)
     return FALSE;
 }
 
-static int FormatPart2Fat(HANDLE hDrive, UINT64 StartSectorId)
+static int VentoyUnxzImage(BYTE *data, int len, BYTE **blocks, unsigned int blockSize, unsigned int blockCount)
+{
+    int consumed = 0, rc;
+    g_unxz_blocks = blocks;
+    g_unxz_block_size = blockSize;
+    g_unxz_capacity = blockSize * blockCount;
+    g_unxz_written = 0;
+    rc = unxz(data, len, NULL, disk_xz_flush, NULL, &consumed, unxz_error);
+    g_unxz_blocks = NULL;
+    if (rc || consumed != len || g_unxz_written != g_unxz_capacity)
+    {
+        Log("Image decode failed: rc=%d input=%d/%d output=%u/%u", rc, consumed, len,
+            g_unxz_written, g_unxz_capacity);
+        return 1;
+    }
+    return 0;
+}
+
+static void FreePart2Image(void)
 {
     int i;
-    int rc = 0;
-    int len = 0;
-    int writelen = 0;
-    int partwrite = 0;
-    int Pos = PT_WRITE_VENTOY_START;
-    DWORD dwSize = 0;
-    BOOL bRet;
-    unsigned char *data = NULL;
-    LARGE_INTEGER liCurrentPosition;
-	LARGE_INTEGER liNewPosition;
-    BYTE *CheckBuf = NULL;
-
-	Log("FormatPart2Fat %llu...", (ULONGLONG)StartSectorId);
-
-    CheckBuf = malloc(SIZE_1MB);
-    if (!CheckBuf)
-    {
-        Log("Failed to malloc check buf");
-        return 1;
-    }
-
-    rc = ReadWholeFileToBuf(VENTOY_FILE_DISK_IMG, 0, (void **)&data, &len);
-    if (rc)
-    {
-        Log("Failed to read img file %p %u", data, len);
-        free(CheckBuf);
-        return 1;
-    }
-
-    liCurrentPosition.QuadPart = StartSectorId * 512;
-    SetFilePointerEx(hDrive, liCurrentPosition, &liNewPosition, FILE_BEGIN);
-
+    for (i = 0; i < (g_part_img_split ? VENTOY_EFI_PART_SIZE / SIZE_1MB : 1); i++)
+        free(g_part_img_buf[i]);
     memset(g_part_img_buf, 0, sizeof(g_part_img_buf));
+    g_part_img_split = FALSE;
+}
 
-    g_part_img_buf[0] = (BYTE *)malloc(VENTOY_EFI_PART_SIZE);
-    if (g_part_img_buf[0])
+static int PreparePart2Image(BOOL SecureBoot)
+{
+    int i, len = 0, rc = FRONT_ERR_IMAGE;
+    BYTE *data = NULL;
+    memset(g_part_img_buf, 0, sizeof(g_part_img_buf));
+    g_part_img_split = FALSE;
+    if (ReadWholeFileToBuf(VENTOY_FILE_DISK_IMG, 0, (void **)&data, &len)) goto out;
+    g_part_img_buf[0] = malloc(VENTOY_EFI_PART_SIZE);
+    if (!g_part_img_buf[0])
     {
-        Log("Malloc whole img buffer success, now decompress ...");
-        unxz(data, len, NULL, NULL, g_part_img_buf[0], &writelen, unxz_error);
-
-        if (len == writelen)
-        {
-            Log("decompress finished success");
-
-			VentoyProcSecureBoot(g_SecureBoot);
-
-            for (i = 0; i < VENTOY_EFI_PART_SIZE / SIZE_1MB; i++)
-            {
-                dwSize = 0;
-				bRet = WriteFile(hDrive, g_part_img_buf[0] + i * SIZE_1MB, SIZE_1MB, &dwSize, NULL);
-                Log("Write part data bRet:%u dwSize:%u code:%u", bRet, dwSize, LASTERR);
-
-                if (!bRet)
-                {
-                    rc = 1;
-                    goto End;
-                }
-
-                PROGRESS_BAR_SET_POS(Pos);
-                if (i % 2 == 0)
-                {
-                    Pos++;
-                }
-            }
-
-            //Read and check the data
-            liCurrentPosition.QuadPart = StartSectorId * 512;
-            SetFilePointerEx(hDrive, liCurrentPosition, &liNewPosition, FILE_BEGIN);
-
-            for (i = 0; i < VENTOY_EFI_PART_SIZE / SIZE_1MB; i++)
-            {
-                bRet = ReadFile(hDrive, CheckBuf, SIZE_1MB, &dwSize, NULL);
-                Log("Read part data bRet:%u dwSize:%u code:%u", bRet, dwSize, LASTERR);
-
-                if (!bRet || memcmp(CheckBuf, g_part_img_buf[0] + i * SIZE_1MB, SIZE_1MB))
-                {
-                    Log("### [Check Fail] The data write and read does not match");
-                    rc = 1;
-                    goto End;
-                }
-
-                PROGRESS_BAR_SET_POS(Pos);
-                if (i % 2 == 0)
-                {
-                    Pos++;
-                }
-            }
-        }
-        else
-        {
-            rc = 1;
-            Log("decompress finished failed");
-            goto End;
-        }
-    }
-    else
-    {
-        Log("Failed to malloc whole img size %u, now split it", VENTOY_EFI_PART_SIZE);
-
-        partwrite = 1;
+        g_part_img_split = TRUE;
         for (i = 0; i < VENTOY_EFI_PART_SIZE / SIZE_1MB; i++)
         {
-            g_part_img_buf[i] = (BYTE *)malloc(SIZE_1MB);
-            if (g_part_img_buf[i] == NULL)
-            {
-                rc = 1;
-                goto End;
-            }
-        }
-
-        Log("Malloc part img buffer success, now decompress ...");
-
-        g_part_img_pos = g_part_img_buf[0];
-
-        unxz(data, len, NULL, disk_xz_flush, NULL, NULL, unxz_error);
-
-        if (g_disk_unxz_len == VENTOY_EFI_PART_SIZE)
-        {
-            Log("decompress finished success");
-			
-			VentoyProcSecureBoot(g_SecureBoot);
-
-            for (i = 0; i < VENTOY_EFI_PART_SIZE / SIZE_1MB; i++)
-            {
-                dwSize = 0;
-                bRet = WriteFile(hDrive, g_part_img_buf[i], SIZE_1MB, &dwSize, NULL);
-                Log("Write part data bRet:%u dwSize:%u code:%u", bRet, dwSize, LASTERR);
-
-                if (!bRet)
-                {
-                    rc = 1;
-                    goto End;
-                }
-                
-                PROGRESS_BAR_SET_POS(Pos);
-                if (i % 2 == 0)
-                {
-                    Pos++;
-                }
-            }
-
-            //Read and check the data
-            liCurrentPosition.QuadPart = StartSectorId * 512;
-            SetFilePointerEx(hDrive, liCurrentPosition, &liNewPosition, FILE_BEGIN);
-
-            for (i = 0; i < VENTOY_EFI_PART_SIZE / SIZE_1MB; i++)
-            {
-                bRet = ReadFile(hDrive, CheckBuf, SIZE_1MB, &dwSize, NULL);
-                Log("Read part data bRet:%u dwSize:%u code:%u", bRet, dwSize, LASTERR);
-
-                if (!bRet || memcmp(CheckBuf, g_part_img_buf[i], SIZE_1MB))
-                {
-                    Log("### [Check Fail] The data write and read does not match");
-                    rc = 1;
-                    goto End;
-                }
-
-                PROGRESS_BAR_SET_POS(Pos);
-                if (i % 2 == 0)
-                {
-                    Pos++;
-                }
-            }
-        }
-        else
-        {
-            rc = 1;
-            Log("decompress finished failed");
-            goto End;
+            g_part_img_buf[i] = malloc(SIZE_1MB);
+            if (!g_part_img_buf[i]) { rc = FRONT_ERR_MEMORY; goto out; }
         }
     }
-
-End:
-
-    if (data) free(data);
-    if (CheckBuf)free(CheckBuf);
-
-    if (partwrite)
-    {
-        for (i = 0; i < VENTOY_EFI_PART_SIZE / SIZE_1MB; i++)
-        {
-            if (g_part_img_buf[i]) free(g_part_img_buf[i]);
-        }
-    }
-    else
-    {
-        if (g_part_img_buf[0]) free(g_part_img_buf[0]);
-    }
-
+    if (VentoyUnxzImage(data, len, g_part_img_buf,
+            g_part_img_split ? SIZE_1MB : VENTOY_EFI_PART_SIZE,
+            g_part_img_split ? VENTOY_EFI_PART_SIZE / SIZE_1MB : 1) || VentoyProcSecureBoot(SecureBoot)) goto out;
+    rc = FRONT_ERR_NONE;
+out:
+    free(data);
+    if (rc) FreePart2Image();
     return rc;
+}
+
+static int WritePart2Image(HANDLE hDrive, UINT64 StartSectorId, BYTE *CheckBuf)
+{
+    int i, Pos = PT_WRITE_VENTOY_START;
+    BYTE *buf;
+    DWORD bytes;
+    LARGE_INTEGER pos;
+    for (i = 0; i < VENTOY_EFI_PART_SIZE / SIZE_1MB; i++)
+    {
+        buf = g_part_img_split ? g_part_img_buf[i] : g_part_img_buf[0] + i * SIZE_1MB;
+        if (!WriteDataToPhyDisk(hDrive, StartSectorId * 512 + i * (UINT64)SIZE_1MB, buf, SIZE_1MB)) return 1;
+        PROGRESS_BAR_SET_POS(Pos);
+        if (i % 2 == 0) Pos++;
+    }
+    if (!FlushFileBuffers(hDrive)) return 1;
+    pos.QuadPart = StartSectorId * 512;
+    if (!SetFilePointerEx(hDrive, pos, NULL, FILE_BEGIN)) return 1;
+    for (i = 0; i < VENTOY_EFI_PART_SIZE / SIZE_1MB; i++)
+    {
+        buf = g_part_img_split ? g_part_img_buf[i] : g_part_img_buf[0] + i * SIZE_1MB;
+        if (!ReadFile(hDrive, CheckBuf, SIZE_1MB, &bytes, NULL) || bytes != SIZE_1MB || memcmp(CheckBuf, buf, SIZE_1MB)) return 1;
+        PROGRESS_BAR_SET_POS(Pos);
+        if (i % 2 == 0) Pos++;
+    }
+    return 0;
+}
+
+static int FormatPart2Fat(HANDLE hDrive, UINT64 StartSectorId, BOOL SecureBoot)
+{
+    int rc = 1;
+    BYTE *check = malloc(SIZE_1MB);
+    if (!check) return 1;
+    if (!PreparePart2Image(SecureBoot)) rc = WritePart2Image(hDrive, StartSectorId, check);
+    FreePart2Image();
+    free(check);
+    return rc;
+}
+
+static int PrepareGrubStage1(int PartStyle, BYTE **RawBuf)
+{
+    int len = 0, rc = FRONT_ERR_IMAGE;
+    BYTE *data = NULL;
+    *RawBuf = malloc(SIZE_1MB - 512);
+    if (!*RawBuf) return FRONT_ERR_MEMORY;
+    if (ReadWholeFileToBuf(VENTOY_FILE_STG1_IMG, 0, (void **)&data, &len)) goto out;
+    if (VentoyUnxzImage(data, len, RawBuf, SIZE_1MB - 512, 1)) goto out;
+    if (PartStyle) (*RawBuf)[500] = 35;
+    rc = FRONT_ERR_NONE;
+out:
+    free(data);
+    if (rc) { free(*RawBuf); *RawBuf = NULL; }
+    return rc;
+}
+
+static int WriteGrubStage1Image(HANDLE hDrive, int PartStyle, BYTE *RawBuf, BYTE *CheckBuf)
+{
+    DWORD bytes, start = PartStyle ? 34 * 512 : 512;
+    DWORD expected = SIZE_1MB - start;
+    LARGE_INTEGER pos;
+    if (!WriteDataToPhyDisk(hDrive, start, RawBuf, expected) || !FlushFileBuffers(hDrive)) return 1;
+    pos.QuadPart = start;
+    if (!SetFilePointerEx(hDrive, pos, NULL, FILE_BEGIN) ||
+        !ReadFile(hDrive, CheckBuf, expected, &bytes, NULL) || bytes != expected || memcmp(CheckBuf, RawBuf, expected)) return 1;
+    return 0;
 }
 
 static int WriteGrubStage1ToPhyDrive(HANDLE hDrive, int PartStyle)
 {
-    int Len = 0;
-    int readLen = 0;
-    BOOL bRet;
-    DWORD dwSize;
-    BYTE *ImgBuf = NULL;
-    BYTE *RawBuf = NULL;
-
-    Log("WriteGrubStage1ToPhyDrive ...");
-
-    RawBuf = (BYTE *)malloc(SIZE_1MB);
-    if (!RawBuf)
-    {
-        return 1;
-    }
-
-    if (ReadWholeFileToBuf(VENTOY_FILE_STG1_IMG, 0, (void **)&ImgBuf, &Len))
-    {
-        Log("Failed to read stage1 img");
-        free(RawBuf);
-        return 1;
-    }
-
-    unxz(ImgBuf, Len, NULL, NULL, RawBuf, &readLen, unxz_error);
-
-    if (PartStyle)
-    {
-        Log("Write GPT stage1 ...");
-        RawBuf[500] = 35;//update blocklist
-        SetFilePointer(hDrive, 512 * 34, NULL, FILE_BEGIN);        
-        bRet = WriteFile(hDrive, RawBuf, SIZE_1MB - 512 * 34, &dwSize, NULL);
-    }
-    else
-    {
-        Log("Write MBR stage1 ...");
-        SetFilePointer(hDrive, 512, NULL, FILE_BEGIN);
-        bRet = WriteFile(hDrive, RawBuf, SIZE_1MB - 512, &dwSize, NULL);
-    }
-
-    Log("WriteFile Ret:%u dwSize:%u ErrCode:%u", bRet, dwSize, GetLastError());
-
-    free(RawBuf);
-    free(ImgBuf);
-    return 0;
+    int rc = 1;
+    BYTE *raw = NULL, *check = malloc(SIZE_1MB);
+    if (!check) return 1;
+    if (!PrepareGrubStage1(PartStyle, &raw)) rc = WriteGrubStage1Image(hDrive, PartStyle, raw, check);
+    free(raw);
+    free(check);
+    return rc;
 }
 
 
@@ -1829,7 +1556,7 @@ int InstallVentoy2FileImage(PHY_DRIVE_INFO *pPhyDrive, int PartStyle)
         Log("decompress finished success");
         g_part_img_buf[0] = pData + SIZE_1MB;
 
-        VentoyProcSecureBoot(g_SecureBoot);
+        if (VentoyProcSecureBoot(g_SecureBoot)) { rc = 1; goto End; }
     }
     else
     {
@@ -2112,7 +1839,7 @@ int InstallVentoy2PhyDrive(PHY_DRIVE_INFO *pPhyDrive, int PartStyle, int TryId)
     PROGRESS_BAR_SET_POS(PT_FORMAT_PART2);
     Log("Writing part2 FAT img ...");
     
-    if (0 != FormatPart2Fat(hDrive, Part2StartSector))
+    if (0 != FormatPart2Fat(hDrive, Part2StartSector, g_SecureBoot))
     {
         Log("FormatPart2Fat failed.");
         rc = 1;
@@ -2337,6 +2064,306 @@ End:
 }
 
 
+static int WriteFrontEfi(PHY_DRIVE_INFO *pPhyDrive, BOOL Updating)
+{
+    int i, j, count = 0, rc = 1;
+    DWORD bytes, size, ignored;
+    BOOL gpt, changed = FALSE, imagePrepared = FALSE;
+    HANDLE disk = INVALID_HANDLE_VALUE, backup = INVALID_HANDLE_VALUE;
+    HANDLE search = INVALID_HANDLE_VALUE, volume = INVALID_HANDLE_VALUE;
+    HANDLE backupDir = INVALID_HANDLE_VALUE;
+    HANDLE locked[128];
+    struct { DWORD NumberOfDiskExtents; DISK_EXTENT Extents[128]; } volumes;
+    STORAGE_DEVICE_NUMBER device;
+    VTOY_GPT_INFO table;
+    VTOY_GPT_HDR backupHead;
+    MBR_HEAD boot;
+    GUID zero = { 0 }, guid;
+    static const GUID basic = { 0xebd0a0a2, 0xb9e5, 0x4433, { 0x87, 0xc0, 0x68, 0xb6, 0xb7, 0x26, 0x99, 0xc7 } };
+    BYTE *saved = NULL, *check = NULL, *stage1 = NULL;
+    const DWORD frontBytes = 33 * SIZE_1MB;
+    DWORD tailBytes = 0;
+    UINT64 tailOffset;
+    LARGE_INTEGER pos;
+    char volumeName[MAX_PATH], diskName[64], backupName[MAX_PATH] = { 0 }, directory[MAX_PATH];
+    char finalDirectory[MAX_PATH], *volumeEnd;
+    ULARGE_INTEGER freeBytes;
+
+    Log("VTOY_FRONT_EFI_V1 VTOY_FRONT_EFI_SAFE_V2: %s", Updating ? "update" : "install");
+    pPhyDrive->FrontEfiError = FRONT_ERR_SECTOR;
+    pPhyDrive->FrontEfiState = FRONT_STATE_UNTOUCHED;
+    pPhyDrive->FrontBackupPath[0] = 0;
+    if (pPhyDrive->BytesPerLogicalSector != 512) goto out;
+    pPhyDrive->FrontEfiError = FRONT_ERR_PACKAGE;
+    if (!VentoyCheckFrontEfiPackage()) goto out;
+
+    pPhyDrive->FrontEfiError = FRONT_ERR_BACKUP_LOCATION;
+    size = GetFullPathNameA(".\\ventoy", sizeof(directory), directory, NULL);
+    if (!size || size >= sizeof(directory)) goto out;
+    backupDir = CreateFileA(directory, FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE,
+        NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    if (backupDir == INVALID_HANDLE_VALUE) goto out;
+    size = GetFinalPathNameByHandleA(backupDir, finalDirectory, sizeof(finalDirectory), VOLUME_NAME_GUID);
+    if (!size || size >= sizeof(finalDirectory)) goto out;
+    safe_strcpy(volumeName, finalDirectory);
+    volumeEnd = strstr(volumeName, "}\\");
+    if (!volumeEnd) goto out;
+    volumeEnd[1] = 0;
+    volume = CreateFileA(volumeName, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    if (volume == INVALID_HANDLE_VALUE ||
+        !DeviceIoControl(volume, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, NULL, 0,
+            &volumes, sizeof(volumes), &bytes, NULL) || !volumes.NumberOfDiskExtents ||
+        volumes.NumberOfDiskExtents > 128 ||
+        bytes < FIELD_OFFSET(VOLUME_DISK_EXTENTS, Extents) + volumes.NumberOfDiskExtents * sizeof(DISK_EXTENT)) goto out;
+    for (i = 0; i < (int)volumes.NumberOfDiskExtents; i++)
+        if (volumes.Extents[i].DiskNumber == (DWORD)pPhyDrive->PhyDrive) goto out;
+    CHECK_CLOSE_HANDLE(volume);
+    if (strlen(finalDirectory) + 80 >= sizeof(backupName)) goto out;
+    safe_sprintf(backupName, "%s\\front-efi-disk%d-%lu-%llu.bin", finalDirectory,
+        pPhyDrive->PhyDrive, GetCurrentProcessId(), GetTickCount64());
+
+    pPhyDrive->FrontEfiError = FRONT_ERR_VOLUME_QUERY;
+    search = FindFirstVolumeA(volumeName, sizeof(volumeName));
+    if (search == INVALID_HANDLE_VALUE) goto out;
+    do
+    {
+        volumeName[strlen(volumeName) - 1] = 0;
+        volume = CreateFileA(volumeName, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+        if (volume == INVALID_HANDLE_VALUE)
+        {
+            Log("Cannot enumerate a volume safely; front EFI operation stopped.");
+            goto out;
+        }
+        size = 0;
+        if (!DeviceIoControl(volume, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, NULL, 0,
+                &volumes, sizeof(volumes), &size, NULL))
+        {
+            if (!DeviceIoControl(volume, IOCTL_STORAGE_GET_DEVICE_NUMBER, NULL, 0,
+                    &device, sizeof(device), &size, NULL) || size < sizeof(device) ||
+                (device.DeviceType == FILE_DEVICE_DISK && device.DeviceNumber == (DWORD)pPhyDrive->PhyDrive))
+            {
+                Log("Cannot establish volume ownership; front EFI operation stopped.");
+                goto out;
+            }
+            CHECK_CLOSE_HANDLE(volume);
+            continue;
+        }
+        if (!volumes.NumberOfDiskExtents || volumes.NumberOfDiskExtents > 128 ||
+            size < FIELD_OFFSET(VOLUME_DISK_EXTENTS, Extents) + volumes.NumberOfDiskExtents * sizeof(DISK_EXTENT)) goto out;
+        for (i = 0; i < (int)volumes.NumberOfDiskExtents; i++)
+            if (volumes.Extents[i].DiskNumber == (DWORD)pPhyDrive->PhyDrive) break;
+        if (i == (int)volumes.NumberOfDiskExtents)
+        {
+            CHECK_CLOSE_HANDLE(volume);
+            continue;
+        }
+        if (volumes.NumberOfDiskExtents != 1)
+        {
+            Log("Spanned volumes are not supported by front EFI installation.");
+            goto out;
+        }
+        CHECK_CLOSE_HANDLE(volume);
+        if (count == 128) goto out;
+        volume = CreateFileA(volumeName, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+            NULL, OPEN_EXISTING, FILE_FLAG_WRITE_THROUGH, NULL);
+        pPhyDrive->FrontEfiError = FRONT_ERR_VOLUME_BUSY;
+        if (volume == INVALID_HANDLE_VALUE ||
+            !DeviceIoControl(volume, FSCTL_LOCK_VOLUME, NULL, 0, NULL, 0, &ignored, NULL) ||
+            !DeviceIoControl(volume, FSCTL_DISMOUNT_VOLUME, NULL, 0, NULL, 0, &ignored, NULL))
+        {
+            Log("Cannot exclusively lock a volume; front EFI operation stopped.");
+            goto out;
+        }
+        locked[count] = volume;
+        count++;
+        volume = INVALID_HANDLE_VALUE;
+        pPhyDrive->FrontEfiError = FRONT_ERR_VOLUME_QUERY;
+    } while (FindNextVolumeA(search, volumeName, sizeof(volumeName)));
+    if (GetLastError() != ERROR_NO_MORE_FILES) goto out;
+    FindVolumeClose(search);
+    search = INVALID_HANDLE_VALUE;
+
+    safe_sprintf(diskName, "\\\\.\\PhysicalDrive%d", pPhyDrive->PhyDrive);
+    pPhyDrive->FrontEfiError = FRONT_ERR_DISK_CHANGED;
+    disk = CreateFileA(diskName, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ,
+        NULL, OPEN_EXISTING, FILE_FLAG_WRITE_THROUGH, NULL);
+    if (disk == INVALID_HANDLE_VALUE) goto out;
+    if (!VentoyPhydriveMatchHandle(pPhyDrive, disk)) goto out;
+    pPhyDrive->FrontEfiError = FRONT_ERR_DISK_IO;
+    if (!ReadFile(disk, &table, sizeof(table), &bytes, NULL) || bytes != sizeof(table)) goto out;
+    pPhyDrive->FrontEfiError = FRONT_ERR_DISK_CHANGED;
+    if (memcmp(&table, &pPhyDrive->Gpt, sizeof(table)))
+    {
+        Log("Disk identity or partition table changed after confirmation; stopped before writing.");
+        goto out;
+    }
+    if (!VentoyCheckFrontLayout(&table, pPhyDrive->SizeInBytes, Updating, &pPhyDrive->FrontEfiError)) goto out;
+    gpt = table.MBR.PartTbl[0].FsFlag == 0xEE;
+    tailBytes = gpt ? 33 * 512 : 0;
+    tailOffset = pPhyDrive->SizeInBytes - tailBytes;
+    pPhyDrive->FrontEfiError = FRONT_ERR_BACKUP_LOCATION;
+    if (!GetDiskFreeSpaceExA(finalDirectory, &freeBytes, NULL, NULL)) goto out;
+    pPhyDrive->FrontEfiError = FRONT_ERR_BACKUP_IO;
+    if (freeBytes.QuadPart < (UINT64)frontBytes + tailBytes) goto out;
+    pPhyDrive->FrontEfiError = FRONT_ERR_MEMORY;
+    saved = malloc(frontBytes + tailBytes);
+    check = malloc(SIZE_1MB);
+    if (!saved || !check) goto out;
+    pPhyDrive->FrontEfiError = FRONT_ERR_DISK_IO;
+    pos.QuadPart = 0;
+    if (!SetFilePointerEx(disk, pos, NULL, FILE_BEGIN) ||
+        !ReadFile(disk, saved, frontBytes, &bytes, NULL) || bytes != frontBytes) goto out;
+    if (gpt)
+    {
+        VTOY_GPT_HDR head;
+        pos.QuadPart = tailOffset;
+        if (!SetFilePointerEx(disk, pos, NULL, FILE_BEGIN) ||
+            !ReadFile(disk, saved + frontBytes, tailBytes, &bytes, NULL) || bytes != tailBytes) goto out;
+        memcpy(&head, saved + frontBytes + 32 * 512, sizeof(head));
+        VentoyFillBackupGptHead(&table, &backupHead);
+        if (memcmp(&head, &backupHead, sizeof(head)) ||
+            memcmp(saved + frontBytes, table.PartTbl, sizeof(table.PartTbl)))
+        {
+            pPhyDrive->FrontEfiError = FRONT_ERR_LAYOUT;
+            Log("GPT backup does not match the primary table.");
+            goto out;
+        }
+    }
+    pPhyDrive->FrontEfiError = FRONT_ERR_BACKUP_IO;
+    backup = CreateFileA(backupName, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_FLAG_WRITE_THROUGH, NULL);
+    if (backup == INVALID_HANDLE_VALUE ||
+        !WriteFile(backup, saved, frontBytes + tailBytes, &bytes, NULL) || bytes != frontBytes + tailBytes ||
+        !FlushFileBuffers(backup)) goto out;
+    CHECK_CLOSE_HANDLE(backup);
+    safe_strcpy(pPhyDrive->FrontBackupPath, backupName);
+    Log("Front EFI backup: %s (first %u bytes, then last %u bytes)", backupName, frontBytes, tailBytes);
+
+    pPhyDrive->FrontEfiError = FRONT_ERR_LAYOUT;
+    if (!Updating)
+    {
+        if (gpt)
+        {
+            for (i = 1; i < 128 && memcmp(&table.PartTbl[i].PartType, &zero, sizeof(zero)); i++);
+            if (i == 128) goto out;
+            for (j = i; j > 0; j--) table.PartTbl[j] = table.PartTbl[j - 1];
+            memset(&table.PartTbl[0], 0, sizeof(table.PartTbl[0]));
+            table.PartTbl[0].PartType = basic;
+            if (CoCreateGuid(&table.PartTbl[0].PartGuid) != S_OK) goto out;
+            table.PartTbl[0].StartLBA = 2048;
+            table.PartTbl[0].LastLBA = 67583;
+            table.PartTbl[0].Attr = VENTOY_EFI_PART_ATTR;
+            memcpy(table.PartTbl[0].Name, L"VTOYEFI", 7 * sizeof(WCHAR));
+            table.Head.PartTblCrc = VentoyCrc32(table.PartTbl, sizeof(table.PartTbl));
+            table.Head.Crc = 0;
+            table.Head.Crc = VentoyCrc32(&table.Head, table.Head.Length);
+        }
+        else
+        {
+            for (i = 1; i < 4 && table.MBR.PartTbl[i].SectorCount; i++);
+            if (i == 4) goto out;
+            for (j = i; j > 0; j--) table.MBR.PartTbl[j] = table.MBR.PartTbl[j - 1];
+            memset(&table.MBR.PartTbl[0], 0, sizeof(PART_TABLE));
+            VentoyFillMBRLocation(pPhyDrive->SizeInBytes, 2048, 65536, &table.MBR.PartTbl[0]);
+            table.MBR.PartTbl[0].FsFlag = 0xEF;
+            for (i = 1; i < 4 && table.MBR.PartTbl[i].Active != 0x80; i++);
+            if (i == 4) table.MBR.PartTbl[0].Active = 0x80;
+        }
+    }
+    pPhyDrive->FrontEfiError = FRONT_ERR_IMAGE;
+    if (VentoyGetLocalBootImg(&boot)) goto out;
+    if (Updating) memcpy(boot.BootCode + 0x180, table.MBR.BootCode + 0x180, 16);
+    else
+    {
+        if (CoCreateGuid(&guid) != S_OK) goto out;
+        memcpy(boot.BootCode + 0x180, &guid, 16);
+    }
+    memcpy(table.MBR.BootCode, boot.BootCode, 440);
+    if (gpt) table.MBR.BootCode[92] = 0x22;
+
+    pPhyDrive->FrontEfiError = PreparePart2Image(FALSE);
+    if (pPhyDrive->FrontEfiError) goto out;
+    imagePrepared = TRUE;
+    pPhyDrive->FrontEfiError = PrepareGrubStage1(gpt, &stage1);
+    if (pPhyDrive->FrontEfiError) goto out;
+    if (Updating)
+        memcpy(stage1 + (2040 - (gpt ? 34 : 1)) * 512, saved + 2040 * 512, 4096);
+    pPhyDrive->FrontEfiError = FRONT_ERR_DISK_IO;
+    changed = TRUE;
+    pPhyDrive->FrontEfiState = FRONT_STATE_CHANGED;
+    if (WritePart2Image(disk, 2048, check) || WriteGrubStage1Image(disk, gpt, stage1, check)) goto out;
+    if (gpt && !Updating)
+    {
+        VentoyFillBackupGptHead(&table, &backupHead);
+        if (!WriteDataToPhyDisk(disk, tailOffset, table.PartTbl, sizeof(table.PartTbl)) ||
+            !WriteDataToPhyDisk(disk, tailOffset + 32 * 512, &backupHead, sizeof(backupHead))) goto out;
+    }
+    size = gpt && !Updating ? sizeof(table) : sizeof(table.MBR);
+    if (!WriteDataToPhyDisk(disk, 0, &table, size) || !FlushFileBuffers(disk)) goto out;
+    pos.QuadPart = 0;
+    if (!SetFilePointerEx(disk, pos, NULL, FILE_BEGIN) ||
+        !ReadFile(disk, check, size, &bytes, NULL) || bytes != size || memcmp(check, &table, size)) goto out;
+    if (gpt && !Updating)
+    {
+        pos.QuadPart = tailOffset;
+        if (!SetFilePointerEx(disk, pos, NULL, FILE_BEGIN) ||
+            !ReadFile(disk, check, tailBytes, &bytes, NULL) || bytes != tailBytes ||
+            memcmp(check, table.PartTbl, sizeof(table.PartTbl)) ||
+            memcmp(check + 32 * 512, &backupHead, sizeof(backupHead))) goto out;
+    }
+    pPhyDrive->FrontEfi = TRUE;
+    pPhyDrive->Part2GPTAttr = gpt ? table.PartTbl[0].Attr : 0;
+    pPhyDrive->SecureBootSupport = FALSE;
+    pPhyDrive->DataStartSector = gpt ? table.PartTbl[1].StartLBA : table.MBR.PartTbl[1].StartSectorId;
+    pPhyDrive->MBR = table.MBR;
+    pPhyDrive->PartStyle = gpt;
+    safe_strcpy(pPhyDrive->VentoyVersion, GetLocalVentoyVersion());
+    pPhyDrive->FrontEfiError = FRONT_ERR_NONE;
+    pPhyDrive->FrontEfiState = FRONT_STATE_COMPLETE;
+    rc = 0;
+out:
+    if (rc && changed)
+    {
+        BOOL restored = WriteDataToPhyDisk(disk, 0, saved, frontBytes);
+        if (tailBytes && !WriteDataToPhyDisk(disk, pPhyDrive->SizeInBytes - tailBytes, saved + frontBytes, tailBytes))
+            restored = FALSE;
+        if (!FlushFileBuffers(disk)) restored = FALSE;
+        pos.QuadPart = 0;
+        if (!SetFilePointerEx(disk, pos, NULL, FILE_BEGIN)) restored = FALSE;
+        for (i = 0; restored && i < (int)(frontBytes / SIZE_1MB); i++)
+            if (!ReadFile(disk, check, SIZE_1MB, &bytes, NULL) || bytes != SIZE_1MB ||
+                memcmp(check, saved + i * SIZE_1MB, SIZE_1MB)) restored = FALSE;
+        if (restored && tailBytes)
+        {
+            pos.QuadPart = tailOffset;
+            if (!SetFilePointerEx(disk, pos, NULL, FILE_BEGIN) ||
+                !ReadFile(disk, check, tailBytes, &bytes, NULL) || bytes != tailBytes ||
+                memcmp(check, saved + frontBytes, tailBytes)) restored = FALSE;
+        }
+        pPhyDrive->FrontEfiState = restored ? FRONT_STATE_RESTORED : FRONT_STATE_RESTORE_FAILED;
+        Log("Front EFI failed; restore %s. Keep backup %s.", restored ? "verified" : "FAILED", backupName);
+    }
+    if (disk != INVALID_HANDLE_VALUE)
+        DeviceIoControl(disk, IOCTL_DISK_UPDATE_PROPERTIES, NULL, 0, NULL, 0, &ignored, NULL);
+    CHECK_CLOSE_HANDLE(disk);
+    CHECK_CLOSE_HANDLE(backup);
+    CHECK_CLOSE_HANDLE(backupDir);
+    CHECK_CLOSE_HANDLE(volume);
+    if (search != INVALID_HANDLE_VALUE) FindVolumeClose(search);
+    for (i = 0; i < count; i++)
+    {
+        DeviceIoControl(locked[i], FSCTL_UNLOCK_VOLUME, NULL, 0, NULL, 0, &ignored, NULL);
+        CloseHandle(locked[i]);
+    }
+    if (imagePrepared) FreePart2Image();
+    free(stage1);
+    free(saved);
+    free(check);
+    Log("Front EFI result: error=%d state=%d backup=%s", pPhyDrive->FrontEfiError,
+        pPhyDrive->FrontEfiState, pPhyDrive->FrontBackupPath);
+    if (rc == 0) GetVentoyFsNameInPhyDrive(pPhyDrive);
+    return rc;
+}
+
 int PartitionResizeForVentoy(PHY_DRIVE_INFO *pPhyDrive)
 {
 	int i, j;
@@ -2357,6 +2384,7 @@ int PartitionResizeForVentoy(PHY_DRIVE_INFO *pPhyDrive)
 	static GUID BiosGrubPartType = { 0x21686148, 0x6449, 0x6e6f, { 0x74, 0x4e, 0x65, 0x65, 0x64, 0x45, 0x46, 0x49 } };
 
 	Log("#####################################################");
+    if (pPhyDrive->ResizeFrontEfi) return WriteFrontEfi(pPhyDrive, FALSE);
 	Log("PartitionResizeForVentoy PhyDrive%d <<%s %s %dGB>>",
 		pPhyDrive->PhyDrive, pPhyDrive->VendorId, pPhyDrive->ProductId,
 		GetHumanReadableGBSize(pPhyDrive->SizeInBytes));
@@ -2399,7 +2427,7 @@ int PartitionResizeForVentoy(PHY_DRIVE_INFO *pPhyDrive)
 			CHECK_CLOSE_HANDLE(hDrive);
 
 
-			if (PartResizePreCheck(NULL) && pPhyDrive->ResizeNoShrink)
+			if (PartResizePreCheck(NULL, FALSE) && pPhyDrive->ResizeNoShrink)
 			{
 				Log("Recheck after Shrink volume success");
 				Log("After shrink Disksize:%llu Part2Start:%llu", pPhyDrive->SizeInBytes, pPhyDrive->ResizePart2StartSector * 512);
@@ -2429,7 +2457,7 @@ int PartitionResizeForVentoy(PHY_DRIVE_INFO *pPhyDrive)
 
 	//Write partition 2 data
 	PROGRESS_BAR_SET_POS(PT_FORMAT_PART2);
-	if (0 != FormatPart2Fat(hDrive, pPhyDrive->ResizePart2StartSector))
+	if (0 != FormatPart2Fat(hDrive, pPhyDrive->ResizePart2StartSector, g_SecureBoot))
 	{
 		Log("FormatPart2Fat failed.");
 		goto End;
@@ -2850,6 +2878,7 @@ int UpdateVentoy2PhyDrive(PHY_DRIVE_INFO *pPhyDrive, int TryId)
 	UINT8 ReservedData[4096];
 
 	Log("#####################################################");
+    if (pPhyDrive->FrontEfi) return TryId == 1 ? WriteFrontEfi(pPhyDrive, TRUE) : 1;
 	Log("UpdateVentoy2PhyDrive try%d %s PhyDrive%d <<%s %s %dGB>>", TryId,
 		pPhyDrive->PartStyle ? "GPT" : "MBR", pPhyDrive->PhyDrive, pPhyDrive->VendorId, pPhyDrive->ProductId,
 		GetHumanReadableGBSize(pPhyDrive->SizeInBytes));
@@ -3125,7 +3154,7 @@ int UpdateVentoy2PhyDrive(PHY_DRIVE_INFO *pPhyDrive, int TryId)
     PROGRESS_BAR_SET_POS(PT_FORMAT_PART2);
 
     Log("Write Ventoy to disk ............................ ");
-    if (0 != FormatPart2Fat(hDrive, StartSector))
+    if (0 != FormatPart2Fat(hDrive, StartSector, g_SecureBoot))
     {
         rc = 1;
         goto End;

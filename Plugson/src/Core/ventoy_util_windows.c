@@ -510,12 +510,14 @@ static int VentoyFatDiskRead(uint32 Sector, uint8 *Buffer, uint32 SectorCount)
     return 1;
 }
 
-static int GetVentoyVersion(int PhyDrive, ventoy_disk *disk)
+static int GetVentoyVersion(int PhyDrive, UINT64 DataOffset, ventoy_disk *disk)
 {
     int ret = 1;
     BOOL bRet;
     DWORD dwBytes;
     UINT64 Part2Offset;
+    UINT64 DataStart, DataSize, EfiSize;
+    int EfiIndex = 1;
     HANDLE Handle = INVALID_HANDLE_VALUE;
 	VTOY_GPT_INFO *pGPT = NULL;
 	CHAR Drive[64];
@@ -563,15 +565,36 @@ static int GetVentoyVersion(int PhyDrive, ventoy_disk *disk)
             goto out;
         }
 
-		Part2Offset = pGPT->PartTbl[1].StartLBA;
+        if (pGPT->PartTbl[0].StartLBA == 2048 && pGPT->PartTbl[0].LastLBA == 67583 &&
+            pGPT->PartTbl[1].StartLBA >= 67584 &&
+            pGPT->PartTbl[0].Name[0] == 'V' && pGPT->PartTbl[0].Name[1] == 'T')
+            EfiIndex = 0;
+        Part2Offset = pGPT->PartTbl[EfiIndex].StartLBA;
+        EfiSize = pGPT->PartTbl[EfiIndex].LastLBA - Part2Offset + 1;
+        DataStart = pGPT->PartTbl[1 - EfiIndex].StartLBA;
+        DataSize = pGPT->PartTbl[1 - EfiIndex].LastLBA - DataStart + 1;
         disk->cur_part_style = 1;
     }
     else
     {
-		Part2Offset = pGPT->MBR.PartTbl[1].StartSectorId;
+        if (pGPT->MBR.PartTbl[0].StartSectorId == 2048 &&
+            pGPT->MBR.PartTbl[0].SectorCount == 65536 && pGPT->MBR.PartTbl[0].FsFlag == 0xEF &&
+            pGPT->MBR.PartTbl[1].StartSectorId >= 67584)
+            EfiIndex = 0;
+        Part2Offset = pGPT->MBR.PartTbl[EfiIndex].StartSectorId;
+        EfiSize = pGPT->MBR.PartTbl[EfiIndex].SectorCount;
+        DataStart = pGPT->MBR.PartTbl[1 - EfiIndex].StartSectorId;
+        DataSize = pGPT->MBR.PartTbl[1 - EfiIndex].SectorCount;
         disk->cur_part_style = 0;        
     }
 
+
+    if (EfiSize != 65536 || !DataSize || DataOffset != DataStart * 512 ||
+        (EfiIndex == 1 && (DataStart != 2048 || DataStart + DataSize != Part2Offset)))
+    {
+        vlog("Selected volume does not match the Ventoy data partition\n");
+        goto out;
+    }
 
     g_FatPhyDrive = Handle;
     g_Part2StartSec = Part2Offset;
@@ -604,6 +627,7 @@ int CheckRuntimeEnvironment(char Letter, ventoy_disk *disk)
 {
     int PhyDrive;
     UINT64 Offset = 0;
+    UINT64 DataOffset = 0;
     char Drive[32];
     DWORD FsFlag;
 	CHAR Vendor[128] = { 0 };
@@ -616,11 +640,7 @@ int CheckRuntimeEnvironment(char Letter, ventoy_disk *disk)
 		vlog("GetPhyDriveByLogicalDrive failed %d %llu\n", PhyDrive, (ULONGLONG)Offset);
         return 1;
     }
-	if (Offset != 1048576)
-	{
-		vlog("Partition offset is NOT 1MB. This is NOT ventoy image partition (%llu)\n", (ULONGLONG)Offset);
-		return 1;
-	}
+    DataOffset = Offset;
 
     if (GetPhyDriveInfo(PhyDrive, &Offset, Vendor, Product) != 0)
     {
@@ -646,7 +666,7 @@ int CheckRuntimeEnvironment(char Letter, ventoy_disk *disk)
     
     strlcpy(disk->cur_fsname, FsName);
 
-    if (GetVentoyVersion(PhyDrive, disk) != 0)
+    if (GetVentoyVersion(PhyDrive, DataOffset, disk) != 0)
     {
 		vlog("GetVentoyVersion failed %u\n", LASTERR);
         return 1;

@@ -583,9 +583,15 @@ STATIC EFI_STATUS EFIAPI ventoy_find_iso_disk(IN EFI_HANDLE ImageHandle)
             pMBR = (MBR_HEAD *)pBuffer;
             if (g_os_param_reserved[6] == 0 && pMBR->PartTbl[0].FsFlag != 0xEE)
             {
-                if (pMBR->PartTbl[0].StartSectorId != 2048 ||
+                if (pMBR->PartTbl[0].StartSectorId == 2048 &&
+                    pMBR->PartTbl[0].FsFlag == 0xEF && pMBR->PartTbl[0].SectorCount == 65536 &&
+                    pMBR->PartTbl[1].StartSectorId >= 67584 && pMBR->PartTbl[1].SectorCount > 0)
+                {
+                    debug("VTOY_FRONT_EFI_V1 data partition start:%u", pMBR->PartTbl[1].StartSectorId);
+                }
+                else if (pMBR->PartTbl[0].StartSectorId != 2048 ||
                     pMBR->PartTbl[1].SectorCount != 65536 ||
-                    pMBR->PartTbl[1].StartSectorId != pMBR->PartTbl[0].StartSectorId + pMBR->PartTbl[0].SectorCount)
+                    pMBR->PartTbl[1].StartSectorId != (UINT64)pMBR->PartTbl[0].StartSectorId + pMBR->PartTbl[0].SectorCount)
                 {
                     debug("Failed to check disk part table");
                     ventoy_warn_invalid_device();

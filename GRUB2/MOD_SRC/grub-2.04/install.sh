@@ -2,12 +2,22 @@
 
 VT_DIR=$PWD/../../..
 
+case "$1" in
+    uefi) front_arch=x86_64-efi; front_image=EFI/BOOT/grubx64_real.efi ;;
+    i386efi) front_arch=i386-efi; front_image=EFI/BOOT/grubia32_real.efi ;;
+    arm64) front_arch=arm64-efi; front_image=EFI/BOOT/BOOTAA64.EFI ;;
+    mips64el) front_arch=mips64el-efi; front_image=EFI/BOOT/BOOTMIPS.EFI ;;
+    *) front_arch=i386-pc; front_image=grub/i386-pc/core.img ;;
+esac
+mkdir -p "$VT_DIR/GRUB2/front-efi"
+rm -f "$VT_DIR/GRUB2/front-efi/$front_arch.sha256"
+
 rm -rf $VT_DIR/GRUB2/INSTALL
 rm -rf $VT_DIR/GRUB2/PXE
 mkdir -p $VT_DIR/GRUB2/INSTALL
 mkdir -p $VT_DIR/GRUB2/PXE
 
-make install
+make install || exit 1
 
 PATH=$VT_DIR/GRUB2/INSTALL/bin/:$VT_DIR/GRUB2/INSTALL/sbin/:$PATH
 
@@ -25,24 +35,24 @@ all_modules_mips64el_uefi="file setkey blocklist ventoy test true regexp newc se
 if [ "$1" = "uefi" ]; then
     all_modules="$net_modules_uefi $all_modules_uefi "
 
-    grub-mkimage -v --directory "$VT_DIR/GRUB2/INSTALL/lib/grub/x86_64-efi" --prefix '(,2)/grub' --output "$VT_DIR/INSTALL/EFI/BOOT/grubx64_real.efi"  --format 'x86_64-efi' --compression 'auto'  $all_modules_uefi
+    grub-mkimage -v --directory "$VT_DIR/GRUB2/INSTALL/lib/grub/x86_64-efi" --prefix '/grub' --output "$VT_DIR/INSTALL/EFI/BOOT/grubx64_real.efi"  --format 'x86_64-efi' --compression 'auto'  $all_modules_uefi || exit 1
 
     #grub-mkimage -v --directory "$VT_DIR/GRUB2/INSTALL/lib/grub/x86_64-efi" -c "$VT_DIR/LiveCD/GRUB/embed.cfg" --prefix '/EFI/boot' --output "$VT_DIR/LiveCD/GRUB/bootx64.efi"  --format 'x86_64-efi' --compression 'auto'  $all_modules_uefi 'fat' 'part_msdos'
 elif [ "$1" = "i386efi" ]; then
     all_modules="$net_modules_uefi $all_modules_uefi "
 
-    grub-mkimage -v --directory "$VT_DIR/GRUB2/INSTALL/lib/grub/i386-efi" --prefix '(,2)/grub' --output "$VT_DIR/INSTALL/EFI/BOOT/grubia32_real.efi"  --format 'i386-efi' --compression 'auto'  $all_modules_uefi
+    grub-mkimage -v --directory "$VT_DIR/GRUB2/INSTALL/lib/grub/i386-efi" --prefix '/grub' --output "$VT_DIR/INSTALL/EFI/BOOT/grubia32_real.efi"  --format 'i386-efi' --compression 'auto'  $all_modules_uefi || exit 1
 elif [ "$1" = "arm64" ]; then
     all_modules="$net_modules_uefi $all_modules_arm64_uefi "
 
-    grub-mkimage -v --directory "$VT_DIR/GRUB2/INSTALL/lib/grub/arm64-efi" --prefix '(,2)/grub' --output "$VT_DIR/INSTALL/EFI/BOOT/BOOTAA64.EFI"  --format 'arm64-efi' --compression 'auto'  $all_modules_arm64_uefi
+    grub-mkimage -v --directory "$VT_DIR/GRUB2/INSTALL/lib/grub/arm64-efi" --prefix '/grub' --output "$VT_DIR/INSTALL/EFI/BOOT/BOOTAA64.EFI"  --format 'arm64-efi' --compression 'auto'  $all_modules_arm64_uefi || exit 1
 elif [ "$1" = "mips64el" ]; then
     all_modules="$net_modules_uefi $all_modules_mips64el_uefi "
 
-    grub-mkimage -v --directory "$VT_DIR/GRUB2/INSTALL/lib/grub/mips64el-efi" --prefix '(,2)/grub' --output "$VT_DIR/INSTALL/EFI/BOOT/BOOTMIPS.EFI"  --format 'mips64el-efi' --compression 'auto'  $all_modules_mips64el_uefi
+    grub-mkimage -v --directory "$VT_DIR/GRUB2/INSTALL/lib/grub/mips64el-efi" --prefix '/grub' --output "$VT_DIR/INSTALL/EFI/BOOT/BOOTMIPS.EFI"  --format 'mips64el-efi' --compression 'auto'  $all_modules_mips64el_uefi || exit 1
 else
     all_modules="$net_modules_legacy $all_modules_legacy "
-    grub-mkimage -v --directory "$VT_DIR/GRUB2/INSTALL/lib/grub/i386-pc" --prefix '(,2)/grub' --output "$VT_DIR/INSTALL/grub/i386-pc/core.img"  --format 'i386-pc' --compression 'auto'  $all_modules_legacy  'fat' 'part_msdos' 'biosdisk' 
+    grub-mkimage -v --directory "$VT_DIR/GRUB2/INSTALL/lib/grub/i386-pc" --prefix '(,2)/grub' --output "$VT_DIR/INSTALL/grub/i386-pc/core.img"  --format 'i386-pc' --compression 'auto'  $all_modules_legacy  'fat' 'part_msdos' 'biosdisk' || exit 1
     
     #grub-mkimage -v --directory "$VT_DIR/GRUB2/INSTALL/lib/grub/i386-pc" -c "$VT_DIR/LiveCD/GRUB/embed.cfg" --prefix '/EFI/boot' --output "$VT_DIR/LiveCD/GRUB/cdrom.img"  --format 'i386-pc-eltorito' --compression 'auto'  $all_modules_legacy 'biosdisk' 'iso9660' 'fat' 'part_msdos'
     #rm -f $VT_DIR/LiveCD/GRUB/boot_hybrid.img
@@ -134,4 +144,16 @@ else
             cp -a $VT_DIR/GRUB2/INSTALL/lib/grub/i386-pc/$line    $VT_DIR/INSTALL/grub/i386-pc/
         fi
     done
+fi
+
+# The BIOS core is compressed; bind it to the verified uncompressed build inputs.
+if grep -aFq VTOY_FRONT_EFI_V1 "$VT_DIR/GRUB2/INSTALL/lib/grub/$front_arch/kernel.img" &&
+   grep -aFq VTOY_FRONT_EFI_V1 "$VT_DIR/GRUB2/INSTALL/lib/grub/$front_arch/ventoy.mod"; then
+    (
+        cd "$VT_DIR/INSTALL" || exit 1
+        sha256sum "$front_image" || exit 1
+        if [ "$front_arch" = "i386-pc" ]; then
+            sha256sum grub/i386-pc/boot.img || exit 1
+        fi
+    ) > "$VT_DIR/GRUB2/front-efi/$front_arch.sha256" || exit 1
 fi

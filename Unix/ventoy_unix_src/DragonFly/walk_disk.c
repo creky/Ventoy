@@ -100,49 +100,6 @@ static int find_disk_by_signature(uint8_t *uuid, uint8_t *sig, uint64_t size, in
     return 0;
 }
 
-static int find_disk_by_size(uint64_t size, const char *prefix, int *count, char *name)
-{
-    int len;
-    int cnt = 0;
-    FTS *ftsp;
-	FTSENT *p;
-    static char dev[] = "/dev", *devav[] = {dev, NULL};
-
-    if (prefix)
-    {
-        len = strlen(prefix);
-    }
-
-    name[0] = 0;
-    ftsp = fts_open(devav, FTS_PHYSICAL | FTS_NOCHDIR, NULL);
-    while ((p = fts_read(ftsp)) != NULL)
-    {
-        if (p->fts_level == 1 && p->fts_statp && p->fts_name && p->fts_statp->st_size == size)
-        {
-            if (prefix)
-            {
-                if (strncmp(p->fts_name, prefix, len) == 0)
-                {
-                    cnt++;
-                    if (name[0] == 0)
-                        strcpy(name, p->fts_name);
-                }
-            }
-            else
-            {
-                cnt++;
-                if (name[0] == 0)
-                    strcpy(name, p->fts_name);
-            }
-        }
-    }
-
-    *count = cnt;
-    fts_close(ftsp);
-
-    return 0;
-}
-
 int prepare_dmtable(void)
 {
     int count = 0;
@@ -151,7 +108,6 @@ int prepare_dmtable(void)
     uint32_t disk_sector_num = 0;
     FILE *fIn, *fOut;
     char disk[MAXPATHLEN];
-    char prefix[MAXPATHLEN];
     ventoy_image_desc desc;
     ventoy_img_chunk chunk;
     
@@ -177,27 +133,14 @@ int prepare_dmtable(void)
     for (i = 0; count <= 0 && i < 10; i++)
     {
         sleep(2);
-        find_disk_by_size(desc.part1_size, NULL, &count, disk);
-        vdebug("[VTOY] find disk by part1 size, i=%d, count=%d, %s\n", i, count, disk);
+        find_disk_by_signature(desc.disk_uuid, desc.disk_signature, desc.disk_size, &count, disk);
+        vdebug("[VTOY] find whole disk by signature: %d %s\n", count, disk);
     }
 
-    if (count == 0)
+    if (count != 1)
     {
+        printf("[VTOY] Failed to find disk by signature\n");
         goto end;
-    }
-    else if (count > 1)
-    {
-        find_disk_by_signature(desc.disk_uuid, desc.disk_signature, desc.disk_size, &count, prefix);
-        vdebug("[VTOY] find disk by signature: %d %s\n", count, prefix);
-
-        if (count != 1)
-        {
-            printf("[VTOY] Failed to find disk by signature\n");
-            goto end;
-        }
-
-        find_disk_by_size(desc.part1_size, prefix, &count, disk);
-        vdebug("[VTOY] find disk by part1 size with prefix %s : %d %s\n", prefix, count, disk);
     }
 
     for (i = 0; i < desc.img_chunk_count; i++)
@@ -209,11 +152,11 @@ int prepare_dmtable(void)
 
         fprintf(fOut, "%u %u linear /dev/%s %llu\n", 
                (sector_start << 2), disk_sector_num, 
-               disk, (unsigned long long)chunk.disk_start_sector - 2048);
+               disk, (unsigned long long)chunk.disk_start_sector);
         
         vdebug("%u %u linear /dev/%s %llu\n", 
                (sector_start << 2), disk_sector_num, 
-               disk, (unsigned long long)chunk.disk_start_sector - 2048);
+               disk, (unsigned long long)chunk.disk_start_sector);
     }
 
 end:    

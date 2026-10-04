@@ -60,6 +60,46 @@ else
     OPT='-a'
 fi
 
+front_efi_ready=1
+front_efi_binary() {
+    if [ ! -f "$1" ] || ! grep -aFq "${2:-VTOY_FRONT_EFI_V1}" "$1"; then
+        echo "Front EFI unavailable: rebuild $1"
+        front_efi_ready=0
+    fi
+}
+
+for front_arch in i386-pc x86_64-efi i386-efi arm64-efi mips64el-efi; do
+    front_receipt="../GRUB2/front-efi/$front_arch.sha256"
+    if [ ! -s "$front_receipt" ] || ! sha256sum --status -c "$front_receipt"; then
+        echo "Front EFI unavailable: rebuild GRUB $front_arch (missing or mismatched build receipt)"
+        front_efi_ready=0
+    fi
+done
+
+for front_file in ./ventoy/ventoy_x64.efi ./ventoy/ventoy_ia32.efi ./ventoy/ventoy_aa64.efi \
+    ./ventoy/vtoyjump32.exe ./ventoy/vtoyjump64.exe \
+    ../VtoyTool/vtoytool/00/vtoytool_32 ../VtoyTool/vtoytool/00/vtoytool_64 \
+    ../VtoyTool/vtoytool/00/vtoytool_aa64 ../VtoyTool/vtoytool/00/vtoytool_m64e \
+    ../VtoyTool/vtoytool/01/vtoytool_64 ../VtoyTool/vtoytool/02/vtoytool_64; do
+    front_efi_binary "$front_file"
+done
+for front_file in ./Ventoy2Disk.exe \
+    ./tool/i386/vtoycli ./tool/x86_64/vtoycli ./tool/aarch64/vtoycli ./tool/mips64el/vtoycli; do
+    front_efi_binary "$front_file" VTOY_FRONT_EFI_SAFE_V2
+done
+for front_file in ./Ventoy2Disk_*.exe; do
+    [ -e "$front_file" ] || continue
+    front_efi_binary "$front_file" VTOY_FRONT_EFI_SAFE_V2
+done
+
+if [ "$1" = "FRONT_EFI" ] && [ "$front_efi_ready" != "1" ]; then
+    echo "Front EFI package refused: all boot and runtime components must be rebuilt first."
+    exit 1
+fi
+if [ "$front_efi_ready" = "1" ]; then
+    set -e
+fi
+
 dos2unix -q ./tool/ventoy_lib.sh
 dos2unix -q ./tool/VentoyWorker.sh
 dos2unix -q ./tool/VentoyGTK.glade
@@ -77,8 +117,13 @@ fi
 
 
 cd ../IMG
-sh mkcpio.sh
-sh mkloopex.sh
+if [ "$front_efi_ready" = "1" ]; then
+    bash -e -o pipefail mkcpio.sh || exit 1
+    bash -e -o pipefail mkloopex.sh || exit 1
+else
+    sh mkcpio.sh
+    sh mkloopex.sh
+fi
 cd -
 
 cd ../Unix
@@ -99,6 +144,20 @@ cd ../Vlnk
 sh build.sh
 sh pack.sh
 cd -
+
+for front_arch in i386 x86_64 aarch64 mips64el; do
+    front_efi_binary "./tool/$front_arch/V2DServer" 'Front EFI requires the verified CLI updater'
+    for front_file in ./tool/$front_arch/Ventoy2Disk.*; do
+        front_efi_binary "$front_file" 'Front EFI updates require the verified CLI updater'
+    done
+done
+for front_file in ./VentoyPlugson.exe ./VentoyPlugson_X64.exe; do
+    front_efi_binary "$front_file" 'Selected volume does not match the Ventoy data partition'
+done
+if [ "$1" = "FRONT_EFI" ] && [ "$front_efi_ready" != "1" ]; then
+    echo "Front EFI package refused: rebuild every shipped GUI and Windows Plugson binary."
+    exit 1
+fi
 
 
 LOOP=$(losetup -f)
@@ -223,7 +282,8 @@ echo -en "$echo_cmd" | dd bs=1 count=32 of=$tmpmnt/EFI/BOOT/fbx64.efi seek=$magi
 sign_efi $tmpmnt/EFI/BOOT/fbx64.efi
 
 
-umount $tmpmnt && rm -rf $tmpmnt
+umount "$tmpmnt" || exit 1
+rm -rf "$tmpmnt"
 
 
 rm -rf $tmpdir
@@ -280,9 +340,21 @@ dd status=none if=$LOOP of=$tmpdir/ventoy/ventoy.disk.img bs=512 count=$VENTOY_S
 
 xz --check=crc32 $tmpdir/ventoy/ventoy.disk.img
 
+if [ "$front_efi_ready" = "1" ]; then
+    (
+        cd "$tmpdir" || exit 1
+        sha256sum boot/boot.img boot/core.img.xz ventoy/ventoy.disk.img.xz \
+            > ventoy/front-efi.sha256 || exit 1
+    ) || exit 1
+    echo "Front EFI payload verified; ventoy/front-efi.sha256 generated."
+else
+    echo "Ordinary package only: no front-efi.sha256; front EFI installation remains disabled."
+fi
 
 
-losetup -d $LOOP && rm -f img.bin
+
+losetup -d "$LOOP" || exit 1
+rm -f img.bin
 
 rm -f ventoy-${curver}-linux.tar.gz
 

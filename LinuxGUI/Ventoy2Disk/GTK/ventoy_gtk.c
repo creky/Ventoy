@@ -795,6 +795,17 @@ void on_button_update_clicked(GtkWidget *widget, gpointer data)
         return;
     }
 
+    if (cur->vtoydata.front_efi)
+    {
+        GtkWidget *dialog = gtk_message_dialog_new(NULL, GTK_DIALOG_MODAL,
+            GTK_MESSAGE_INFO, GTK_BUTTONS_OK,
+            "Front EFI updates require the verified CLI updater:\nsudo sh Ventoy2Disk.sh -u %s",
+            cur->disk_path);
+        gtk_dialog_run(GTK_DIALOG(dialog));
+        gtk_widget_destroy(dialog);
+        return;
+    }
+
     if (GTK_RESPONSE_OK != msgbox(GTK_MESSAGE_INFO, GTK_BUTTONS_OK_CANCEL, "STR_UPDATE_TIP"))
     {
         return;

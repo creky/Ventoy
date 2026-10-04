@@ -1288,6 +1288,13 @@ static int ventoy_api_update(struct mg_connection *conn, VTOY_JSON *json)
         return 0;
     }
 
+    if (disk->vtoydata.front_efi)
+    {
+        vlog("Front EFI requires the verified CLI updater: sh Ventoy2Disk.sh -u %s\n", disk->disk_path);
+        ventoy_json_result(conn, "{\"result\":\"front_efi_cli\"}");
+        return 0;
+    }
+
     scnprintf(path, "/sys/block/%s", diskname);
     if (access(path, F_OK) < 0)
     {
